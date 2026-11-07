@@ -16,6 +16,30 @@ const fallbackIndexHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-
 </main>
 </body></html>`
 
+const fallbackLoginHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 - YYB Go 控制台</title>
+<body style="margin:0;min-height:100vh;display:grid;place-items:center;background:oklch(0.974 0.004 250);color:oklch(0.19 0.025 252);font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif">
+<main style="width:min(380px,calc(100vw - 32px));background:oklch(1 0 0);border:1px solid oklch(0.885 0.012 250);border-radius:12px;padding:32px">
+<h1 style="margin:0 0 4px;font-size:18px;text-align:center">YYB Go 控制台</h1>
+<p style="margin:0 0 22px;font-size:13px;color:oklch(0.43 0.025 252);text-align:center">请登录后继续</p>
+<p id="err" style="display:none;background:oklch(0.955 0.032 25);color:oklch(0.55 0.18 25);border-radius:8px;padding:9px 12px;font-size:13px;margin:0 0 14px">用户名或密码不正确</p>
+<form method="post" action="/login">
+<input type="hidden" name="next" id="next" value="/">
+<label for="username" style="display:block;font-size:13px;margin:0 0 6px">用户名</label>
+<input id="username" name="username" required style="width:100%;height:40px;border:1px solid oklch(0.885 0.012 250);border-radius:8px;padding:0 12px;font-size:14px;margin:0 0 14px">
+<label for="password" style="display:block;font-size:13px;margin:0 0 6px">密码</label>
+<input id="password" name="password" type="password" required style="width:100%;height:40px;border:1px solid oklch(0.885 0.012 250);border-radius:8px;padding:0 12px;font-size:14px;margin:0 0 18px">
+<button type="submit" style="width:100%;height:42px;border:0;border-radius:8px;background:oklch(0.54 0.205 3);color:#fff;font-size:14px;font-weight:700;cursor:pointer">登 录</button>
+</form>
+</main>
+<script>
+const P=new URLSearchParams(location.search);
+if(P.get('error'))document.getElementById('err').style.display='block';
+const N=P.get('next');
+if(N&&N.startsWith('/')&&!N.startsWith('//'))document.getElementById('next').value=N;
+</script>
+</body></html>`
+
 const fallbackScanHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>扫码添加账号</title>
 <body style="margin:0;min-height:100vh;display:grid;place-items:center;background:oklch(0.974 0.004 250);color:oklch(0.19 0.025 252);font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif">
@@ -30,12 +54,9 @@ const fallbackScanHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8
 </main>
 <script>
 let sid,timer;
-const QS=new URLSearchParams(location.search);
-let TOKEN=QS.get('token')||localStorage.getItem('yyb_token')||'';
-if(QS.get('token')){localStorage.setItem('yyb_token',TOKEN);QS.delete('token');history.replaceState(null,'',location.pathname+(QS.toString()?'?'+QS.toString():''));}
-function withToken(u){if(!TOKEN)return u;return u+(u.includes('?')?'&':'?')+'token='+encodeURIComponent(TOKEN);}
 async function api(url,options){
- const resp=await fetch(withToken(url),options);
+ const resp=await fetch(url,options);
+ if(resp.status===401){location.href='/login?next='+encodeURIComponent(location.pathname);throw new Error('unauthorized')}
  const text=await resp.text();
  let data=null;
  try{data=text?JSON.parse(text):null}catch(e){data=text}
@@ -49,7 +70,7 @@ async function newQR(){
  document.getElementById('s').textContent='正在生成二维码';
  const r=await api('/qr',{method:'POST'});
  sid=r.session_id;
- document.getElementById('qr').innerHTML='<img alt="二维码" style="width:240px;height:240px" src="'+withToken(r.image_url)+'">';
+ document.getElementById('qr').innerHTML='<img alt="二维码" style="width:240px;height:240px" src="'+r.image_url+'">';
  document.getElementById('s').textContent='等待扫码';
  timer=setInterval(poll,1500);
 }

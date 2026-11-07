@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,8 +150,8 @@ func newTestApp(t *testing.T, cfg Config) *App {
 	return app
 }
 
-func TestHandlerRequiresAuthToken(t *testing.T) {
-	app := newTestApp(t, Config{AuthToken: "s3cret"})
+func TestHandlerRequiresLogin(t *testing.T) {
+	app := newTestApp(t, Config{AuthUser: "admin", AuthPassword: "s3cret"})
 	handler := app.Handler()
 
 	open := func(method, target string, header map[string]string) *httptest.ResponseRecorder {
@@ -161,33 +163,82 @@ func TestHandlerRequiresAuthToken(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		return rec
 	}
+	login := func(user, pass string) *httptest.ResponseRecorder {
+		form := url.Values{"username": {user}, "password": {pass}, "next": {"/accounts"}}
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
 
+	// Open routes stay open with auth enabled.
 	if rec := open(http.MethodGet, "/health", nil); rec.Code != http.StatusOK {
 		t.Fatalf("GET /health with auth enabled status = %d, want 200", rec.Code)
 	}
-	if rec := open(http.MethodGet, "/scan", nil); rec.Code != http.StatusOK {
-		t.Fatalf("GET /scan with auth enabled status = %d, want 200", rec.Code)
+	if rec := open(http.MethodGet, "/login", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /login status = %d, want 200", rec.Code)
 	}
+
+	// API clients get a 401 JSON envelope; browsers get redirected to /login.
 	if rec := open(http.MethodGet, "/accounts", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("GET /accounts without token status = %d, want 401", rec.Code)
+		t.Fatalf("GET /accounts without session status = %d, want 401", rec.Code)
 	}
-	if rec := open(http.MethodGet, "/accounts?token=wrong", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("GET /accounts with wrong token status = %d, want 401", rec.Code)
+	browser := open(http.MethodGet, "/accounts", map[string]string{"Accept": "text/html,application/xhtml+xml"})
+	if browser.Code != http.StatusFound {
+		t.Fatalf("browser GET /accounts status = %d, want 302", browser.Code)
 	}
-	if rec := open(http.MethodGet, "/accounts?token=s3cret", nil); rec.Code != http.StatusOK {
-		t.Fatalf("GET /accounts with token query param status = %d, want 200", rec.Code)
+	if loc := browser.Header().Get("Location"); !strings.HasPrefix(loc, "/login?next=") {
+		t.Fatalf("browser redirect Location = %q, want /login?next=...", loc)
 	}
+
+	// Wrong credentials do not reach the protected target.
+	if rec := login("admin", "wrong"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /login wrong password status = %d, want 303", rec.Code)
+	} else if strings.Contains(rec.Header().Get("Location"), "/accounts") {
+		t.Fatalf("wrong password redirected to %q, want back to /login", rec.Header().Get("Location"))
+	}
+
+	// Correct credentials redirect to next and set the session cookie.
+	rec := login("admin", "s3cret")
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /login status = %d, want 303", rec.Code)
+	}
+	var session *http.Cookie
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == sessionCookieName {
+			session = ck
+		}
+	}
+	if session == nil || session.Value == "" {
+		t.Fatalf("POST /login did not set %s cookie", sessionCookieName)
+	}
+
+	// Session cookie authorizes protected routes.
+	if rec := open(http.MethodGet, "/accounts", map[string]string{"Cookie": session.Name + "=" + session.Value}); rec.Code != http.StatusOK {
+		t.Fatalf("GET /accounts with session cookie status = %d, want 200", rec.Code)
+	}
+	// Bearer password authorizes API clients without a session.
 	if rec := open(http.MethodGet, "/accounts", map[string]string{"Authorization": "Bearer s3cret"}); rec.Code != http.StatusOK {
-		t.Fatalf("GET /accounts with Bearer header status = %d, want 200", rec.Code)
+		t.Fatalf("GET /accounts with Bearer password status = %d, want 200", rec.Code)
 	}
 	if rec := open(http.MethodGet, "/accounts", map[string]string{"X-YYB-Token": "s3cret"}); rec.Code != http.StatusOK {
-		t.Fatalf("GET /accounts with X-YYB-Token header status = %d, want 200", rec.Code)
+		t.Fatalf("GET /accounts with X-YYB-Token status = %d, want 200", rec.Code)
 	}
-	if rec := open(http.MethodPost, "/qr", nil); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("POST /qr without token status = %d, want 401", rec.Code)
+	if rec := open(http.MethodGet, "/accounts", map[string]string{"Authorization": "Bearer wrong"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /accounts with wrong Bearer status = %d, want 401", rec.Code)
 	}
-	if rec := open(http.MethodGet, "/openapi.json", nil); rec.Code != http.StatusOK {
-		t.Fatalf("GET /openapi.json with auth enabled status = %d, want 200", rec.Code)
+
+	// Logout drops the session.
+	logoutReq := httptest.NewRequest(http.MethodPost, "/logout", nil)
+	logoutReq.AddCookie(session)
+	logoutRec := httptest.NewRecorder()
+	handler.ServeHTTP(logoutRec, logoutReq)
+	if logoutRec.Code != http.StatusSeeOther {
+		t.Fatalf("POST /logout status = %d, want 303", logoutRec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts", map[string]string{"Cookie": session.Name + "=" + session.Value}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /accounts after logout status = %d, want 401", rec.Code)
 	}
 }
 

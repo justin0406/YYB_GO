@@ -653,6 +653,7 @@
         <span class="status-pill" id="healthPill"><span class="status-dot"></span><span>检测服务中</span></span>
         <a class="btn secondary" href="/docs/index.html">Swagger</a>
         <a class="btn primary" href="/scan">扫码添加</a>
+        <button class="btn" id="logoutBtn" type="button">退出登录</button>
       </div>
     </header>
 
@@ -783,19 +784,6 @@
 
     const $ = id => document.getElementById(id);
 
-    // 访问令牌：/index?token=xxx 打开一次即存入 localStorage，后续请求自动携带
-    const qs = new URLSearchParams(location.search);
-    let TOKEN = qs.get("token") || localStorage.getItem("yyb_token") || "";
-    if (qs.get("token")) {
-      localStorage.setItem("yyb_token", TOKEN);
-      qs.delete("token");
-      history.replaceState(null, "", location.pathname + (qs.toString() ? "?" + qs.toString() : ""));
-    }
-    function withToken(url) {
-      if (!TOKEN) return url;
-      return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
-    }
-
     function escapeHTML(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -808,7 +796,11 @@
     async function api(method, url, body) {
       const options = { method, headers: { "Content-Type": "application/json" } };
       if (body !== undefined) options.body = JSON.stringify(body);
-      const response = await fetch(withToken(url), options);
+      const response = await fetch(url, options);
+      if (response.status === 401) {
+        location.href = "/login?next=" + encodeURIComponent(location.pathname);
+        throw new Error("unauthorized");
+      }
       const text = await response.text();
       let data = null;
       try {
@@ -910,7 +902,7 @@
         button.dataset.openid = account.openid;
         button.innerHTML = `
           <span class="avatar">
-            <img alt="" src="${withToken("/accounts/avatar?ref=" + encodeURIComponent(account.openid))}">
+            <img alt="" src="/accounts/avatar?ref=${encodeURIComponent(account.openid)}">
             <span class="avatar-letter hidden">${escapeHTML(name.slice(0, 1).toUpperCase() || "Y")}</span>
           </span>
           <span class="account-main">
@@ -1071,6 +1063,10 @@
     }
 
     $("reloadAccountsBtn").addEventListener("click", loadAccounts);
+    $("logoutBtn").addEventListener("click", async () => {
+      try { await fetch("/logout", { method: "POST" }); } catch {}
+      location.href = "/login";
+    });
     $("refreshAllBtn").addEventListener("click", refreshAll);
     $("resyncAllBtn").addEventListener("click", resyncAll);
     $("featureSel").addEventListener("change", togglePayload);

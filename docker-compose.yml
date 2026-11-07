@@ -1,0 +1,42 @@
+# YYB_GO 服务编排
+#
+# 用法：
+#   1. 生成登录密码：  openssl rand -hex 16
+#   2. 把密码填到下面的 YYB_AUTH_PASSWORD（用户名默认 admin，可改）
+#   3. 启动：          docker compose up -d
+#      更新镜像：      docker compose pull && docker compose up -d
+#   4. 浏览器打开：    http://<host>:8000/  → 跳转登录页，登录后即可使用
+#      接口文档：      http://<host>:8000/docs
+#
+# 程序化调用（脚本/curl）用 Authorization: Bearer <密码> 代替 Cookie。
+# 不设置 YYB_AUTH_PASSWORD 时 /qr /accounts /wxapp 完全不设防，务必修改！
+
+services:
+  yyb-go:
+    # GHCR 官方镜像（Actions 自动构建 linux/amd64 + linux/arm64）
+    image: ghcr.io/justin0406/yyb_go:latest
+    # 想用本地源码构建就注释掉上面的 image，改用这一行：
+    # build: .
+    container_name: yyb-go
+    restart: unless-stopped
+    ports:
+      # 对外暴露；仅本机使用可改成 "127.0.0.1:8000:8000"
+      - "8000:8000"
+    environment:
+      YYB_AUTH_USER: "admin" # 登录用户名
+      YYB_AUTH_PASSWORD: "change-me-please" # 必改：openssl rand -hex 16
+      TZ: Asia/Shanghai
+    volumes:
+      # SQLite 数据库（resource/db/yyb.db）、二维码、头像都在这个卷里；
+      # 想绑定宿主机目录可改为 - ./resource:/app/resource
+      - yyb-resource:/app/resource
+    healthcheck:
+      # 镜像里没有 curl/wget，用 bash 内建的 /dev/tcp 探活
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  yyb-resource:

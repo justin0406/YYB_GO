@@ -2,13 +2,16 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,7 +30,8 @@ type Config struct {
 	ResourceRoot   string
 	DBFilename     string
 	TCPProxy       string
-	AuthToken      string
+	AuthUser       string
+	AuthPassword   string
 	SessionTTL     time.Duration
 	RequestTimeout time.Duration
 	AvatarTimeout  time.Duration
@@ -45,12 +49,22 @@ type App struct {
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
 
+	// sessions holds browser login sessions: cookie value → expiry.
+	sessMu   sync.Mutex
+	sessions map[string]time.Time
+
 	stopPurge chan struct{}
 	purgeDone chan struct{}
 }
 
-// protectedPrefixes lists the path prefixes that require the access token
-// when one is configured. Health checks, docs and the HTML shell stay open.
+const (
+	sessionCookieName = "yyb_session"
+	sessionLifetime   = 7 * 24 * time.Hour
+)
+
+// protectedPrefixes lists the path prefixes that require authentication when
+// a login password is configured. Health checks, docs and the HTML shell
+// stay open.
 var protectedPrefixes = []string{"/qr", "/accounts", "/wxapp"}
 
 var swaggerDocsHandler = httpSwagger.Handler(
@@ -103,6 +117,7 @@ func NewApp(cfg Config) (*App, error) {
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
+		sessions:   map[string]time.Time{},
 		stopPurge:  make(chan struct{}),
 		purgeDone:  make(chan struct{}),
 	}
@@ -160,12 +175,14 @@ func (a *App) Handler() http.Handler {
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
-	if a.cfg.AuthToken != "" {
-		router.Use(a.requireToken())
+	if a.cfg.AuthPassword != "" {
+		router.Use(a.requireAuth())
 	}
 
 	router.Any("/", gin.WrapF(a.handleIndex))
 	router.Any("/scan", gin.WrapF(a.handleScan))
+	router.Any("/login", gin.WrapF(a.handleLogin))
+	router.Any("/logout", gin.WrapF(a.handleLogout))
 	router.Any("/docs", func(c *gin.Context) {
 		c.Redirect(http.StatusMovedPermanently, "/docs/index.html")
 	})
@@ -191,48 +208,206 @@ func (a *App) Handler() http.Handler {
 	return router
 }
 
-// requireToken enforces the configured access token on protected prefixes.
-// It is only installed when cfg.AuthToken is non-empty.
-func (a *App) requireToken() gin.HandlerFunc {
+// requireAuth enforces login on protected prefixes when a password is
+// configured. Browsers get redirected to /login; API clients get a 401
+// JSON envelope and may authenticate with Authorization: Bearer <password>.
+func (a *App) requireAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if a.requestAuthorized(c.Request) {
 			c.Next()
 			return
 		}
+		if wantsHTMLLogin(c.Request) {
+			next := c.Request.URL.Path
+			if next == "" {
+				next = "/"
+			}
+			http.Redirect(c.Writer, c.Request, "/login?next="+url.QueryEscape(next), http.StatusFound)
+			c.Abort()
+			return
+		}
 		c.AbortWithStatusJSON(http.StatusUnauthorized, apiEnvelope{
 			Code: http.StatusUnauthorized,
-			Msg:  "unauthorized: provide the access token via Authorization: Bearer, X-YYB-Token header, or token query param",
+			Msg:  "unauthorized: login at /login or use Authorization: Bearer <password>",
 		})
 	}
 }
 
-func (a *App) requestAuthorized(r *http.Request) bool {
-	if !tokenProtectedPath(r.URL.Path) {
+// wantsHTMLLogin reports whether the request looks like a browser page
+// navigation, in which case an unauthenticated hit should be redirected to
+// the login page instead of answered with a JSON 401.
+func wantsHTMLLogin(r *http.Request) bool {
+	if strings.Contains(r.Header.Get("Accept"), "text/html") {
 		return true
 	}
-	return subtle.ConstantTimeCompare([]byte(a.requestToken(r)), []byte(a.cfg.AuthToken)) == 1
+	return r.Header.Get("Sec-Fetch-Mode") == "navigate" || r.Header.Get("Sec-Fetch-Dest") == "document"
 }
 
-// requestToken extracts the access token from the Authorization header
-// (Bearer scheme), the X-YYB-Token header, or the token query param. The
-// query param exists for contexts that cannot set headers, e.g. <img> tags.
-func (a *App) requestToken(r *http.Request) string {
+func (a *App) requestAuthorized(r *http.Request) bool {
+	if !authRequiredPath(r.URL.Path) {
+		return true
+	}
+	if a.validSession(r) {
+		return true
+	}
+	return a.bearerAuthorized(r)
+}
+
+func (a *App) bearerAuthorized(r *http.Request) bool {
+	candidate := ""
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		candidate = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	} else if h := r.Header.Get("X-YYB-Token"); h != "" {
+		candidate = strings.TrimSpace(h)
 	}
-	if h := r.Header.Get("X-YYB-Token"); h != "" {
-		return strings.TrimSpace(h)
+	if candidate == "" {
+		return false
 	}
-	return strings.TrimSpace(r.URL.Query().Get("token"))
+	return subtle.ConstantTimeCompare([]byte(candidate), []byte(a.cfg.AuthPassword)) == 1
 }
 
-func tokenProtectedPath(path string) bool {
+func authRequiredPath(path string) bool {
 	for _, p := range protectedPrefixes {
 		if strings.HasPrefix(path, p) {
 			return true
 		}
 	}
 	return false
+}
+
+// --- login sessions ---
+
+func (a *App) createSession() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+	a.sessMu.Lock()
+	a.pruneSessionsLocked()
+	a.sessions[token] = time.Now().Add(sessionLifetime)
+	a.sessMu.Unlock()
+	return token, nil
+}
+
+func (a *App) validSession(r *http.Request) bool {
+	ck, err := r.Cookie(sessionCookieName)
+	if err != nil || ck.Value == "" {
+		return false
+	}
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	exp, ok := a.sessions[ck.Value]
+	if !ok || !exp.After(time.Now()) {
+		delete(a.sessions, ck.Value)
+		return false
+	}
+	return true
+}
+
+func (a *App) dropSession(r *http.Request) {
+	if ck, err := r.Cookie(sessionCookieName); err == nil {
+		a.sessMu.Lock()
+		delete(a.sessions, ck.Value)
+		a.sessMu.Unlock()
+	}
+}
+
+func (a *App) pruneSessionsLocked() {
+	now := time.Now()
+	for token, exp := range a.sessions {
+		if !exp.After(now) {
+			delete(a.sessions, token)
+		}
+	}
+}
+
+// --- login / logout handlers ---
+
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		serveFileOrText(w, r, filepath.Join(a.resources.Templates, "login.html"), fallbackLoginHTML)
+	case http.MethodPost:
+		a.doLogin(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (a *App) doLogin(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
+		return
+	}
+	user := strings.TrimSpace(r.PostFormValue("username"))
+	pass := r.PostFormValue("password")
+	next := sanitizeNext(r.PostFormValue("next"))
+
+	wantUser := a.cfg.AuthUser
+	if wantUser == "" {
+		wantUser = "admin"
+	}
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(wantUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(a.cfg.AuthPassword)) == 1
+	if !userOK || !passOK {
+		// Slow down brute force a little; the delay is constant per attempt.
+		time.Sleep(300 * time.Millisecond)
+		target := "/login?error=1"
+		if next != "/" {
+			target += "&next=" + url.QueryEscape(next)
+		}
+		http.Redirect(w, r, target, http.StatusSeeOther)
+		return
+	}
+	token, err := a.createSession()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create session: "+err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(sessionLifetime.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	target := next
+	if target == "" {
+		target = "/"
+	}
+	http.Redirect(w, r, target, http.StatusSeeOther)
+}
+
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	a.dropSession(r)
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// sanitizeNext only allows same-site redirect targets: an absolute path that
+// is not scheme-relative ("//host") and not a backslash trick.
+func sanitizeNext(next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+		return "/"
+	}
+	return next
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {

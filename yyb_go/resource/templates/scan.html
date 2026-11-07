@@ -41,21 +41,12 @@
     const QR_TTL = 110;             // 秒,到点自动重新生成(早于微信真正过期)
     let sid = null, pollTimer = null, cdTimer = null, secsLeft = 0;
 
-    // 访问令牌：/scan?token=xxx 打开一次即存入 localStorage，后续请求自动携带
-    const qs = new URLSearchParams(location.search);
-    let TOKEN = qs.get("token") || localStorage.getItem("yyb_token") || "";
-    if (qs.get("token")) {
-      localStorage.setItem("yyb_token", TOKEN);
-      qs.delete("token");
-      history.replaceState(null, "", location.pathname + (qs.toString() ? "?" + qs.toString() : ""));
-    }
-    function withToken(url) {
-      if (!TOKEN) return url;
-      return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
-    }
-
     async function api(method, url) {
-      const r = await fetch(withToken(url), { method });
+      const r = await fetch(url, { method });
+      if (r.status === 401) {
+        location.href = "/login?next=" + encodeURIComponent(location.pathname);
+        throw { status: 401, message: "unauthorized" };
+      }
       const t = await r.text(); let d; try { d = t ? JSON.parse(t) : null; } catch { d = t; }
       const isEnvelope = d && typeof d === "object" && !Array.isArray(d)
         && Object.prototype.hasOwnProperty.call(d, "code")
@@ -88,7 +79,7 @@
       try {
         const r = await api("POST", "/qr");
         sid = r.session_id;
-        $("qrWrap").innerHTML = `<img src="${withToken(r.image_url + "?t=" + Date.now())}" alt="二维码">`;
+        $("qrWrap").innerHTML = `<img src="${r.image_url}?t=${Date.now()}" alt="二维码">`;
         setStatus("等待扫码…", "s-pending");
         startCountdown();
         pollTimer = setInterval(poll, 1500);
