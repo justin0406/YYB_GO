@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -73,6 +74,7 @@ func httpPost(path, host string, body []byte) []byte {
 
 func send0RTT(ctx context.Context, targets []Target, entry pskEntry, recvKey, envelope []byte, timeout time.Duration, tcpProxy string, fallbackDirect bool) ([]byte, []byte, error) {
 	var last error
+	stale := false
 	for _, t := range targets {
 		code, resp, err := send0RTTRaw(ctx, t, entry, recvKey, envelope, timeout, tcpProxy, fallbackDirect)
 		if err == nil && (len(code) > 0 || len(resp) > 0) {
@@ -80,12 +82,21 @@ func send0RTT(ctx context.Context, targets []Target, entry pskEntry, recvKey, en
 		}
 		if err != nil {
 			last = err
+			if errors.Is(err, ErrStaleSession) {
+				stale = true
+			}
 		} else {
 			last = fmt.Errorf("ShortLink response did not contain application data")
 		}
 	}
 	if last == nil {
 		last = fmt.Errorf("no ShortLink targets")
+	}
+	if stale {
+		// At least one target proved the session/PSK unusable; classify the
+		// whole attempt as stale so callers can re-login instead of retrying
+		// blindly (the request may have been processed).
+		return nil, nil, fmt.Errorf("%w: all ShortLink targets failed; last error: %v", ErrStaleSession, last)
 	}
 	return nil, nil, fmt.Errorf("all ShortLink targets failed; last error: %w", last)
 }
@@ -135,8 +146,13 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 			appdata = r.Payload
 		}
 	}
-	if sh == nil || appdata == nil {
-		return nil, nil, fmt.Errorf("response missing ServerHello/AppData")
+	if sh == nil {
+		return nil, nil, fmt.Errorf("response missing ServerHello")
+	}
+	if appdata == nil {
+		// Server answered the handshake but sent no application data: the PSK
+		// was most likely rejected and the 0-RTT early data discarded.
+		return nil, nil, fmt.Errorf("%w: PSK rejected (no application data in response)", ErrStaleSession)
 	}
 	candidates := [][]byte{
 		bytes.Join([][]byte{pskCH, sh}, nil),
@@ -161,5 +177,5 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("AppData decrypt/parse failed")
+	return nil, nil, fmt.Errorf("%w: AppData decrypt/parse failed", ErrStaleSession)
 }

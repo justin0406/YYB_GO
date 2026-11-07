@@ -30,8 +30,12 @@ const fallbackScanHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8
 </main>
 <script>
 let sid,timer;
+const QS=new URLSearchParams(location.search);
+let TOKEN=QS.get('token')||localStorage.getItem('yyb_token')||'';
+if(QS.get('token')){localStorage.setItem('yyb_token',TOKEN);QS.delete('token');history.replaceState(null,'',location.pathname+(QS.toString()?'?'+QS.toString():''));}
+function withToken(u){if(!TOKEN)return u;return u+(u.includes('?')?'&':'?')+'token='+encodeURIComponent(TOKEN);}
 async function api(url,options){
- const resp=await fetch(url,options);
+ const resp=await fetch(withToken(url),options);
  const text=await resp.text();
  let data=null;
  try{data=text?JSON.parse(text):null}catch(e){data=text}
@@ -45,7 +49,7 @@ async function newQR(){
  document.getElementById('s').textContent='正在生成二维码';
  const r=await api('/qr',{method:'POST'});
  sid=r.session_id;
- document.getElementById('qr').innerHTML='<img alt="二维码" style="width:240px;height:240px" src="'+r.image_url+'">';
+ document.getElementById('qr').innerHTML='<img alt="二维码" style="width:240px;height:240px" src="'+withToken(r.image_url)+'">';
  document.getElementById('s').textContent='等待扫码';
  timer=setInterval(poll,1500);
 }
@@ -61,13 +65,5 @@ async function poll(){
 }
 newQR();
 </script></body></html>`
-
-const docsHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YYB Go API 文档</title>
-<body style="margin:32px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;line-height:1.6">
-<h1>YYB Go API</h1>
-<p>Swagger UI: <a href="/docs/index.html">/docs/index.html</a></p>
-<p>OpenAPI JSON: <a href="/openapi.json">/openapi.json</a></p>
-</body></html>`
 
 var openAPISpec = newOpenAPISpec()

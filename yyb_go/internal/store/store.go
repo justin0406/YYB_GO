@@ -44,20 +44,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE(wechat_account_id, tcp_proxy)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-
-CREATE TABLE IF NOT EXISTS features (
-    code        INTEGER PRIMARY KEY,
-    name        TEXT    NOT NULL UNIQUE,
-    description TEXT,
-    enabled     INTEGER NOT NULL DEFAULT 1
-);
 `
-
-var defaultFeatures = []Feature{
-	{Code: 1001, Name: "getCode", Description: stringPtr("wx.login code"), Enabled: true},
-	{Code: 1002, Name: "getPhoneNumber", Description: stringPtr("取手机号"), Enabled: true},
-	{Code: 1003, Name: "operateWxData", Description: stringPtr("通用云函数代理"), Enabled: true},
-}
 
 type DB struct {
 	sql *sql.DB
@@ -103,13 +90,6 @@ type SessionRow struct {
 	UpdatedAt       int64
 }
 
-type Feature struct {
-	Code        int     `json:"code"`
-	Name        string  `json:"name"`
-	Description *string `json:"description"`
-	Enabled     bool    `json:"enabled"`
-}
-
 func Open(path string) (*DB, error) {
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -137,16 +117,18 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// The features table is no longer used by any route; drop it from
+	// databases created by older versions. It only ever held the three
+	// built-in default rows.
+	if _, err = db.ExecContext(ctx, "DROP TABLE IF EXISTS features"); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err = db.ExecContext(ctx, schema); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	out := &DB{sql: db}
-	if err = out.EnsureDefaultFeatures(ctx); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return out, nil
+	return &DB{sql: db}, nil
 }
 
 func (db *DB) Close() error {
@@ -154,19 +136,6 @@ func (db *DB) Close() error {
 		return nil
 	}
 	return db.sql.Close()
-}
-
-func (db *DB) EnsureDefaultFeatures(ctx context.Context) error {
-	for _, f := range defaultFeatures {
-		desc := nullableString(f.Description)
-		if _, err := db.sql.ExecContext(ctx,
-			"INSERT OR IGNORE INTO features(code, name, description, enabled) VALUES(?,?,?,1)",
-			f.Code, f.Name, desc,
-		); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func migrateSessionsTable(ctx context.Context, db *sql.DB) error {
@@ -359,63 +328,6 @@ func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
-func (db *DB) ListFeatures(ctx context.Context, onlyEnabled bool) ([]Feature, error) {
-	sqlText := "SELECT code, name, description, enabled FROM features"
-	if onlyEnabled {
-		sqlText += " WHERE enabled=1"
-	}
-	sqlText += " ORDER BY code"
-	rows, err := db.sql.QueryContext(ctx, sqlText)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Feature
-	for rows.Next() {
-		f, err := scanFeature(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, f)
-	}
-	return out, rows.Err()
-}
-
-func (db *DB) ResolveFeature(ctx context.Context, ref any) (*Feature, error) {
-	switch v := ref.(type) {
-	case float64:
-		return db.GetFeature(ctx, int(v))
-	case int:
-		return db.GetFeature(ctx, v)
-	case string:
-		if isDigits(v) {
-			n, _ := strconv.Atoi(v)
-			return db.GetFeature(ctx, n)
-		}
-		return db.GetFeatureByName(ctx, v)
-	default:
-		return nil, sql.ErrNoRows
-	}
-}
-
-func (db *DB) GetFeature(ctx context.Context, code int) (*Feature, error) {
-	row := db.sql.QueryRowContext(ctx, "SELECT code, name, description, enabled FROM features WHERE code=?", code)
-	f, err := scanFeature(row)
-	if err != nil {
-		return nil, err
-	}
-	return &f, nil
-}
-
-func (db *DB) GetFeatureByName(ctx context.Context, name string) (*Feature, error) {
-	row := db.sql.QueryRowContext(ctx, "SELECT code, name, description, enabled FROM features WHERE name=? COLLATE NOCASE", name)
-	f, err := scanFeature(row)
-	if err != nil {
-		return nil, err
-	}
-	return &f, nil
-}
-
 func (a *WechatAccount) Public() AccountPublic {
 	return AccountPublic{
 		ID:            a.ID,
@@ -434,10 +346,6 @@ func (a *WechatAccount) Public() AccountPublic {
 const selectAccountSQL = `SELECT id, openid, uin, alias, nickname, avatar, user_info, login_buffer, credentials, status, last_checked_at, created_at, updated_at FROM wechat_accounts`
 
 type accountScanner interface {
-	Scan(dest ...any) error
-}
-
-type featureScanner interface {
 	Scan(dest ...any) error
 }
 
@@ -495,18 +403,6 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	return &s, nil
 }
 
-func scanFeature(row featureScanner) (Feature, error) {
-	var f Feature
-	var desc sql.NullString
-	var enabled int
-	if err := row.Scan(&f.Code, &f.Name, &desc, &enabled); err != nil {
-		return Feature{}, err
-	}
-	f.Description = stringPtrFromNull(desc)
-	f.Enabled = enabled != 0
-	return f, nil
-}
-
 func marshalNullable(v map[string]any) (sql.NullString, error) {
 	if v == nil {
 		return sql.NullString{}, nil
@@ -538,8 +434,6 @@ func stringPtrFromNull(v sql.NullString) *string {
 	}
 	return &v.String
 }
-
-func stringPtr(s string) *string { return &s }
 
 func isDigits(s string) bool {
 	if s == "" {

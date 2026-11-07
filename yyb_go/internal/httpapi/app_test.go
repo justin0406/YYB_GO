@@ -1,11 +1,17 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"yyb_go/internal/protocol"
+	"yyb_go/internal/store"
 )
 
 func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
@@ -113,5 +119,123 @@ func TestHandlerServesGinRoutesAndSwaggerDocs(t *testing.T) {
 	handler.ServeHTTP(oldPath, httptest.NewRequest(http.MethodPost, "/accounts/getCode", nil))
 	if oldPath.Code != http.StatusNotFound {
 		t.Fatalf("POST old account feature route status = %d", oldPath.Code)
+	}
+}
+
+func newTestApp(t *testing.T, cfg Config) *App {
+	t.Helper()
+	t.Setenv("GIN_MODE", "test")
+	if cfg.ResourceRoot == "" {
+		cfg.ResourceRoot = t.TempDir()
+	}
+	if cfg.RequestTimeout == 0 {
+		cfg.RequestTimeout = time.Second
+	}
+	if cfg.AvatarTimeout == 0 {
+		cfg.AvatarTimeout = time.Second
+	}
+	if cfg.SessionTTL == 0 {
+		cfg.SessionTTL = time.Minute
+	}
+	if cfg.QRSessionTTL == 0 {
+		cfg.QRSessionTTL = time.Minute
+	}
+	app, err := NewApp(cfg)
+	if err != nil {
+		t.Fatalf("NewApp() error = %v", err)
+	}
+	t.Cleanup(func() { _ = app.Close() })
+	return app
+}
+
+func TestHandlerRequiresAuthToken(t *testing.T) {
+	app := newTestApp(t, Config{AuthToken: "s3cret"})
+	handler := app.Handler()
+
+	open := func(method, target string, header map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, nil)
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := open(http.MethodGet, "/health", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /health with auth enabled status = %d, want 200", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/scan", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /scan with auth enabled status = %d, want 200", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /accounts without token status = %d, want 401", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts?token=wrong", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /accounts with wrong token status = %d, want 401", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts?token=s3cret", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /accounts with token query param status = %d, want 200", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts", map[string]string{"Authorization": "Bearer s3cret"}); rec.Code != http.StatusOK {
+		t.Fatalf("GET /accounts with Bearer header status = %d, want 200", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/accounts", map[string]string{"X-YYB-Token": "s3cret"}); rec.Code != http.StatusOK {
+		t.Fatalf("GET /accounts with X-YYB-Token header status = %d, want 200", rec.Code)
+	}
+	if rec := open(http.MethodPost, "/qr", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /qr without token status = %d, want 401", rec.Code)
+	}
+	if rec := open(http.MethodGet, "/openapi.json", nil); rec.Code != http.StatusOK {
+		t.Fatalf("GET /openapi.json with auth enabled status = %d, want 200", rec.Code)
+	}
+}
+
+func TestInvokeWXAppErrorClassification(t *testing.T) {
+	app := newTestApp(t, Config{})
+	ctx := context.Background()
+	acc, err := app.db.UpsertAccount(ctx, "openid-classify", "buffer", nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount() error = %v", err)
+	}
+
+	// Stale session: exactly one retry, then success; no credential refresh.
+	calls := 0
+	want := map[string]any{"ok": true}
+	result, err := app.invokeWXApp(ctx, acc, "wxapp", nil, func(context.Context, *store.WechatAccount, string, map[string]any) (map[string]any, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("send failed: %w", protocol.ErrStaleSession)
+		}
+		return want, nil
+	})
+	if err != nil {
+		t.Fatalf("invokeWXApp() error = %v, want nil", err)
+	}
+	if calls != 2 {
+		t.Fatalf("stale session retry calls = %d, want 2", calls)
+	}
+	if result["ok"] != true {
+		t.Fatalf("invokeWXApp() result = %#v", result)
+	}
+
+	// Transport error: surfaced as-is, no retry, no status downgrade.
+	calls = 0
+	_, err = app.invokeWXApp(ctx, acc, "wxapp", nil, func(context.Context, *store.WechatAccount, string, map[string]any) (map[string]any, error) {
+		calls++
+		return nil, fmt.Errorf("dial tcp: i/o timeout")
+	})
+	if err == nil || errors.Is(err, accountExpiredError{}) {
+		t.Fatalf("invokeWXApp() transport error = %v, want original error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("transport error calls = %d, want 1 (no retry)", calls)
+	}
+	reloaded, reloadErr := app.db.GetAccount(ctx, acc.ID)
+	if reloadErr != nil {
+		t.Fatalf("GetAccount() error = %v", reloadErr)
+	}
+	if reloaded.Status != nil && *reloaded.Status == "expired" {
+		t.Fatalf("transport error must not mark account expired, status = %q", *reloaded.Status)
 	}
 }

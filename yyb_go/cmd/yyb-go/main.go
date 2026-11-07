@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,12 +22,22 @@ func main() {
 	resourceRoot := flag.String("resource-root", filepath.Join(".", "resource"), "runtime resource directory")
 	dbFilename := flag.String("db", httpapi.DefaultDBFilename, "SQLite database filename under resource/db")
 	tcpProxy := flag.String("tcp-proxy", "", "optional TCP proxy: socks5://host:port or http-connect://host:port")
+	authToken := flag.String("auth-token", "", "API access token; when set, /qr /accounts /wxapp require it (env: YYB_AUTH_TOKEN)")
 	flag.Parse()
+
+	token := strings.TrimSpace(*authToken)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("YYB_AUTH_TOKEN"))
+	}
+	if token == "" {
+		log.Printf("WARNING: no auth token configured; /qr, /accounts and /wxapp are UNPROTECTED. Set -auth-token or YYB_AUTH_TOKEN when exposing this service beyond localhost.")
+	}
 
 	cfg := httpapi.Config{
 		ResourceRoot:   *resourceRoot,
 		DBFilename:     *dbFilename,
 		TCPProxy:       *tcpProxy,
+		AuthToken:      token,
 		SessionTTL:     30 * time.Minute,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,

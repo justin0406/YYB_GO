@@ -2,14 +2,15 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ type Config struct {
 	ResourceRoot   string
 	DBFilename     string
 	TCPProxy       string
+	AuthToken      string
 	SessionTTL     time.Duration
 	RequestTimeout time.Duration
 	AvatarTimeout  time.Duration
@@ -42,7 +44,14 @@ type App struct {
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
+
+	stopPurge chan struct{}
+	purgeDone chan struct{}
 }
+
+// protectedPrefixes lists the path prefixes that require the access token
+// when one is configured. Health checks, docs and the HTML shell stay open.
+var protectedPrefixes = []string{"/qr", "/accounts", "/wxapp"}
 
 var swaggerDocsHandler = httpSwagger.Handler(
 	httpSwagger.URL("/openapi.json"),
@@ -87,21 +96,61 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.ShortlinkTimeout = cfg.RequestTimeout
 	poolCfg.TCPProxy = cfg.TCPProxy
 	pool := protocol.NewPool(poolCfg, db)
-	return &App{
+	app := &App{
 		cfg:        cfg,
 		resources:  res,
 		db:         db,
 		pool:       pool,
 		qr:         qr.NewClient(cfg.RequestTimeout),
 		qrSessions: map[string]*qr.Session{},
-	}, nil
+		stopPurge:  make(chan struct{}),
+		purgeDone:  make(chan struct{}),
+	}
+	app.startPurger()
+	return app, nil
 }
 
 func (a *App) Close() error {
+	select {
+	case <-a.stopPurge:
+	default:
+		close(a.stopPurge)
+	}
+	<-a.purgeDone
 	if a.db != nil {
 		return a.db.Close()
 	}
 	return nil
+}
+
+// startPurger drops expired session rows (reads already skip them, but the
+// rows would otherwise accumulate) and stale QR sessions once at startup and
+// then every hour until Close.
+func (a *App) startPurger() {
+	purgeOnce := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if n, err := a.db.PurgeExpiredSessions(ctx); err != nil {
+			log.Printf("purge expired sessions: %v", err)
+		} else if n > 0 {
+			log.Printf("purged %d expired session(s)", n)
+		}
+		a.pruneQR()
+	}
+	purgeOnce()
+	go func() {
+		defer close(a.purgeDone)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-a.stopPurge:
+				return
+			case <-ticker.C:
+				purgeOnce()
+			}
+		}
+	}()
 }
 
 func (a *App) Handler() http.Handler {
@@ -111,6 +160,9 @@ func (a *App) Handler() http.Handler {
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery())
+	if a.cfg.AuthToken != "" {
+		router.Use(a.requireToken())
+	}
 
 	router.Any("/", gin.WrapF(a.handleIndex))
 	router.Any("/scan", gin.WrapF(a.handleScan))
@@ -137,6 +189,50 @@ func (a *App) Handler() http.Handler {
 	})
 
 	return router
+}
+
+// requireToken enforces the configured access token on protected prefixes.
+// It is only installed when cfg.AuthToken is non-empty.
+func (a *App) requireToken() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if a.requestAuthorized(c.Request) {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusUnauthorized, apiEnvelope{
+			Code: http.StatusUnauthorized,
+			Msg:  "unauthorized: provide the access token via Authorization: Bearer, X-YYB-Token header, or token query param",
+		})
+	}
+}
+
+func (a *App) requestAuthorized(r *http.Request) bool {
+	if !tokenProtectedPath(r.URL.Path) {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(a.requestToken(r)), []byte(a.cfg.AuthToken)) == 1
+}
+
+// requestToken extracts the access token from the Authorization header
+// (Bearer scheme), the X-YYB-Token header, or the token query param. The
+// query param exists for contexts that cannot set headers, e.g. <img> tags.
+func (a *App) requestToken(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	if h := r.Header.Get("X-YYB-Token"); h != "" {
+		return strings.TrimSpace(h)
+	}
+	return strings.TrimSpace(r.URL.Query().Get("token"))
+}
+
+func tokenProtectedPath(path string) bool {
+	for _, p := range protectedPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -571,8 +667,14 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 	creds := protocol.CredentialsFromMap(acc.Credentials)
 	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
 	if err != nil {
-		_ = a.db.SetAccountStatus(ctx, acc.ID, "expired")
-		return "expired"
+		// Only a server-side rejection means the credentials are really dead;
+		// transport failures leave the status unknown instead of expired.
+		status := "unknown"
+		if errors.Is(err, protocol.ErrAuthRejected) {
+			status = "expired"
+		}
+		_ = a.db.SetAccountStatus(ctx, acc.ID, status)
+		return status
 	}
 	_ = a.db.SetAccountCredential(ctx, acc.ID, result.LoginBuffer, result.Credentials.ToMap())
 	_ = a.db.SetAccountStatus(ctx, acc.ID, "alive")
@@ -598,21 +700,44 @@ type accountExpiredError struct{ openid string }
 
 func (e accountExpiredError) Error() string { return "account expired: " + e.openid }
 
+// invokeWXApp runs a wxapp call with single-retry healing. Errors are
+// classified first: transport and other failures are returned untouched (no
+// credential refresh, no status downgrade, no retry — the request may or may
+// not have been processed, so blindly re-sending is unsafe). Only session-
+// level failures trigger exactly one healing round:
+//   - ErrStaleSession: cached session keys are unusable; drop the session and
+//     retry (re-login with the current login_buffer).
+//   - ErrAuthRejected: the server rejected the login_buffer; refresh the
+//     token + login_buffer, then retry.
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
-	proxy := a.cfg.TCPProxy
-	if _, err := a.db.GetSession(ctx, acc.ID, proxy); err == nil {
-		result, err := call(ctx, acc, appID, payload)
-		if err == nil {
+	result, err := call(ctx, acc, appID, payload)
+	if err == nil {
+		return result, nil
+	}
+	if !errors.Is(err, protocol.ErrStaleSession) && !errors.Is(err, protocol.ErrAuthRejected) {
+		return nil, err
+	}
+	_ = a.db.InvalidateSession(ctx, acc.ID, a.cfg.TCPProxy)
+	if errors.Is(err, protocol.ErrStaleSession) {
+		result, retryErr := call(ctx, acc, appID, payload)
+		if retryErr == nil {
 			return result, nil
 		}
-		_ = a.db.InvalidateSession(ctx, acc.ID, proxy)
+		if !errors.Is(retryErr, protocol.ErrAuthRejected) {
+			return nil, retryErr
+		}
+		err = retryErr
 	}
 	status := a.refreshLiveness(ctx, acc)
-	if status != "alive" {
+	switch status {
+	case "alive":
+	case "expired":
 		return nil, accountExpiredError{openid: acc.OpenID}
+	default:
+		return nil, err
 	}
-	fresh, err := a.db.GetAccount(ctx, acc.ID)
-	if err == nil && fresh != nil {
+	fresh, ferr := a.db.GetAccount(ctx, acc.ID)
+	if ferr == nil && fresh != nil {
 		acc = fresh
 	}
 	return call(ctx, acc, appID, payload)
@@ -770,12 +895,6 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	})
 }
 
-func requestLogger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
-}
-
 func serveFileOrText(w http.ResponseWriter, r *http.Request, path, fallback string) {
 	if _, err := os.Stat(path); err == nil {
 		http.ServeFile(w, r, path)
@@ -814,13 +933,4 @@ func safeName(s string) string {
 		}
 	}
 	return b.String()
-}
-
-func sortedKeys[M ~map[string]V, V any](m M) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }

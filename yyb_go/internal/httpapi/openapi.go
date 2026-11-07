@@ -4,9 +4,12 @@ func newOpenAPISpec() map[string]any {
 	return map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
-			"title":       "YYB Go 接口文档",
-			"description": "用于微信扫码登录、账号管理和 wxapp 接口调用的 API。",
-			"version":     "1.0.0",
+			"title": "YYB Go 接口文档",
+			"description": "用于微信扫码登录、账号管理和 wxapp 接口调用的 API。\n\n" +
+				"当服务配置了访问令牌（启动参数 -auth-token 或环境变量 YYB_AUTH_TOKEN）时，" +
+				"/qr、/accounts、/wxapp 下的接口需要携带令牌：Authorization: Bearer <token>、" +
+				"X-YYB-Token 头，或 token 查询参数（供 img 等无法自定义请求头的场景）。",
+			"version": "1.0.0",
 		},
 		"servers": []map[string]any{
 			{"url": "/"},
@@ -164,6 +167,13 @@ func newOpenAPISpec() map[string]any {
 			},
 		},
 		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"bearerToken": map[string]any{
+					"type":        "http",
+					"scheme":      "bearer",
+					"description": "访问令牌（未配置 -auth-token 时不需要）。也可用 X-YYB-Token 头或 token 查询参数。",
+				},
+			},
 			"schemas": map[string]any{
 				"APIResponse": objectSchema([]string{"code", "msg", "data"}, map[string]any{
 					"code": map[string]any{"type": "integer", "example": 0, "description": "业务状态码，0 表示成功，非 0 表示业务错误。"},

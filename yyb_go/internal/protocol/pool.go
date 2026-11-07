@@ -145,7 +145,7 @@ func (p *Pool) run(ctx context.Context, loginBuffer string, accountID int64, tcp
 	st, err := p.state(ctx, loginBuffer, accountID, effective)
 	if err == nil {
 		res, err := op(ctx, st)
-		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect {
+		if err == nil || effective == "" || !p.cfg.TCPProxyFallbackDirect || errors.Is(err, ErrStaleSession) {
 			return res, err
 		}
 		_ = p.Invalidate(ctx, accountID, effective)
@@ -198,6 +198,9 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	return st, nil
 }
 
+// lockFor returns the per-(account, proxy) login lock. Entries are never
+// removed, but the map is bounded by accounts × proxy variants (two entries
+// per account at most), so unbounded growth is not a concern.
 func (p *Pool) lockFor(key string) *sync.Mutex {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -213,6 +216,10 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
+	meta, err := parseLoginBuffer(loginBuffer)
+	if err != nil {
+		return WmpfSession{}, err
+	}
 	targets, err := getLonglinkTargets(ctx, p.cfg.LoginTimeout, p.cfg.DNSCacheTTL)
 	if err != nil {
 		return WmpfSession{}, fmt.Errorf("HTTPDNS LongLink failed: %w", err)
@@ -220,73 +227,70 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	targets = orderLonglinkTargets(targets, 6)
 	var last error
 	for _, t := range targets {
-		mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
-		if err != nil {
-			last = err
-			continue
+		st, err := p.loginViaTarget(ctx, t, loginBuffer, meta, tcpProxy)
+		if err == nil {
+			return st, nil
 		}
-		defer mc.close()
-		meta, err := parseLoginBuffer(loginBuffer)
-		if err != nil {
-			return WmpfSession{}, err
-		}
-		appDeviceID, err := randomAppDeviceID()
-		if err != nil {
-			return WmpfSession{}, err
-		}
-		temp := &manualAuthTemp{}
-		body, err := buildLoginBody(loginBuffer, meta.DeviceID, appDeviceID, temp)
-		if err != nil {
-			return WmpfSession{}, err
-		}
-		if err = mc.sendApp(cmdManualAuth, body); err != nil {
-			last = err
-			continue
-		}
-		resp, err := mc.recvApp()
-		if err != nil {
-			last = err
-			continue
-		}
-		if resp.Cmd != cmdManualAuth {
-			last = fmt.Errorf("manualauth failed: cmd=%d", resp.Cmd)
-			continue
-		}
-		mar, err := parseLoginResponse(resp.Body, temp)
-		if err != nil {
-			last = err
-			continue
-		}
-		appSess, err := extractSession(mar)
-		if err != nil {
-			last = err
-			continue
-		}
-		appSess.DeviceID = meta.DeviceID
-		appSess.HostAppID = meta.HostAppID
-		psks, err := mc.extractPSKs()
-		if err != nil {
-			last = err
-			continue
-		}
-		psk, ok := pickAccessPSK(psks)
-		if !ok {
-			last = fmt.Errorf("login finished but no access PSK was issued")
-			continue
-		}
-		shortTargets := getShortlinkTargets(ctx, p.cfg.ShortlinkTimeout, p.cfg.DNSCacheTTL)
-		return WmpfSession{
-			Session:          appSess,
-			PSK:              psk,
-			ShortlinkTargets: shortTargets,
-			CreatedAt:        time.Now(),
-			TCPProxy:         tcpProxy,
-		}, nil
+		last = err
 	}
 	if last == nil {
 		last = fmt.Errorf("no LongLink candidates")
 	}
 	return WmpfSession{}, fmt.Errorf("all LongLink candidates failed: %w", last)
+}
+
+func (p *Pool) loginViaTarget(ctx context.Context, t Target, loginBuffer string, meta loginMeta, tcpProxy string) (WmpfSession, error) {
+	mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	defer mc.close()
+
+	appDeviceID, err := randomAppDeviceID()
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	temp := &manualAuthTemp{}
+	body, err := buildLoginBody(loginBuffer, meta.DeviceID, appDeviceID, temp)
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	if err = mc.sendApp(cmdManualAuth, body); err != nil {
+		return WmpfSession{}, err
+	}
+	resp, err := mc.recvApp()
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	if resp.Cmd != cmdManualAuth {
+		return WmpfSession{}, fmt.Errorf("%w: manualauth rejected: cmd=%d", ErrAuthRejected, resp.Cmd)
+	}
+	mar, err := parseLoginResponse(resp.Body, temp)
+	if err != nil {
+		return WmpfSession{}, fmt.Errorf("%w: manualauth response: %v", ErrAuthRejected, err)
+	}
+	appSess, err := extractSession(mar)
+	if err != nil {
+		return WmpfSession{}, fmt.Errorf("%w: manualauth session: %v", ErrAuthRejected, err)
+	}
+	appSess.DeviceID = meta.DeviceID
+	appSess.HostAppID = meta.HostAppID
+	psks, err := mc.extractPSKs()
+	if err != nil {
+		return WmpfSession{}, err
+	}
+	psk, ok := pickAccessPSK(psks)
+	if !ok {
+		return WmpfSession{}, fmt.Errorf("login finished but no access PSK was issued")
+	}
+	shortTargets := getShortlinkTargets(ctx, p.cfg.ShortlinkTimeout, p.cfg.DNSCacheTTL)
+	return WmpfSession{
+		Session:          appSess,
+		PSK:              psk,
+		ShortlinkTargets: shortTargets,
+		CreatedAt:        time.Now(),
+		TCPProxy:         tcpProxy,
+	}, nil
 }
 
 func (p *Pool) sendEnvelope(ctx context.Context, st WmpfSession, envelope []byte) ([]byte, []byte, error) {

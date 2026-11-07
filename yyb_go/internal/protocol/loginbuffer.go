@@ -106,7 +106,7 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 		return "", err
 	}
 	if intFromAny(data["code"]) != 0 {
-		return "", fmt.Errorf("login_buffer failed: code=%v msg=%v", data["code"], data["msg"])
+		return "", fmt.Errorf("%w: login_buffer failed: code=%v msg=%v", ErrAuthRejected, data["code"], data["msg"])
 	}
 	values := stringSlicePath(data, "ext_info", "list_s", "login_buffer", "value")
 	if len(values) == 0 || values[0] == "" {
@@ -140,7 +140,7 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 		return LoginBufferCredentials{}, err
 	}
 	if intFromAny(data["code"]) != 0 {
-		return LoginBufferCredentials{}, fmt.Errorf("refresh failed: code=%v msg=%v", data["code"], data["msg"])
+		return LoginBufferCredentials{}, fmt.Errorf("%w: refresh failed: code=%v msg=%v", ErrAuthRejected, data["code"], data["msg"])
 	}
 	info, _ := data["user_info"].(map[string]any)
 	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)

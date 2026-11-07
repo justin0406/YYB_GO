@@ -465,7 +465,7 @@ func sessionDecrypt(body, recvKey []byte) ([]byte, error) {
 			return pt, nil
 		}
 	}
-	return nil, fmt.Errorf("response decrypt failed")
+	return nil, fmt.Errorf("%w: response decrypt failed", ErrStaleSession)
 }
 
 func extractCode(resp []byte) []byte {

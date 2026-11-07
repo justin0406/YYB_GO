@@ -43,6 +43,12 @@ CREATE TABLE wmpf_sessions (
     UNIQUE(wechat_account_id, tcp_proxy)
 );
 CREATE INDEX idx_sess_expires ON wmpf_sessions(expires_at);
+CREATE TABLE features (
+    code        INTEGER PRIMARY KEY,
+    name        TEXT    NOT NULL UNIQUE,
+    description TEXT,
+    enabled     INTEGER NOT NULL DEFAULT 1
+);
 INSERT INTO wechat_accounts(id, openid, login_buffer, created_at, updated_at)
 VALUES(1, 'openid-1', 'login-buffer', 10, 10);
 INSERT INTO wmpf_sessions(id, wechat_account_id, uin, tcp_proxy, session_blob, expires_at, created_at, updated_at)
@@ -74,6 +80,13 @@ VALUES(7, 1, 12345, '', '{"ready":true}', ?, 20, 20);
 	}
 	if !newExists {
 		t.Fatalf("new sessions table does not exist")
+	}
+	featuresExists, err := sqliteTableExists(ctx, db.sql, "features")
+	if err != nil {
+		t.Fatalf("check features table: %v", err)
+	}
+	if featuresExists {
+		t.Fatalf("unused features table should be dropped by Open")
 	}
 
 	session, err := db.GetSession(ctx, 1, "")
