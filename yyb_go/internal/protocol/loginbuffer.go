@@ -32,6 +32,10 @@ type LoginBufferCredentials struct {
 	Nickname     string `json:"nickname"`
 	ExpiresAt    int64  `json:"expires_at"`
 	ExpiresIn    int64  `json:"expires_in"`
+	// RefreshedAt is the unix time the credential pair AND the login_buffer
+	// behind it were last renewed. The buffer ticket itself lives far shorter
+	// than the token pair, so scheduled renewal tracks this, not ExpiresAt.
+	RefreshedAt int64 `json:"refresh_refreshed_at"`
 }
 
 func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
@@ -43,6 +47,7 @@ func CredentialsFromMap(m map[string]any) LoginBufferCredentials {
 		Nickname:     stringFromMap(m, "nickname"),
 		ExpiresAt:    int64FromMap(m, "expires_at"),
 		ExpiresIn:    defaultInt64(int64FromMap(m, "expires_in"), 7200),
+		RefreshedAt:  int64FromMap(m, "refresh_refreshed_at"),
 	}
 }
 

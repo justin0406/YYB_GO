@@ -898,6 +898,7 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 	creds := protocol.CredentialsFromMap(acc.Credentials)
 	result, err := a.qr.RefreshLoginBuffer(ctx, creds)
 	if err != nil {
+		log.Printf("refresh: account %d credential refresh failed (%T): %v", acc.ID, err, err)
 		// Only a server-side rejection means the credentials are really dead;
 		// transport failures leave the status unknown instead of expired.
 		status := "unknown"
@@ -953,10 +954,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	if !errors.Is(err, protocol.ErrStaleSession) && !errors.Is(err, protocol.ErrAuthRejected) {
 		return nil, err
 	}
+	log.Printf("wxapp: %s failed for account %d (%v); invalidating session", appID, acc.ID, err)
 	_ = a.db.InvalidateSession(ctx, acc.ID, a.cfg.TCPProxy)
 	if errors.Is(err, protocol.ErrStaleSession) {
 		result, retryErr := call(ctx, acc, appID, payload)
 		if retryErr == nil {
+			log.Printf("wxapp: re-login retry for account %d recovered", acc.ID)
 			return result, nil
 		}
 		if !errors.Is(retryErr, protocol.ErrAuthRejected) {
@@ -968,9 +971,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 	// has exhausted its login budget, fail with the original error instead of
 	// provoking the upstream again. The window slides, a later call heals.
 	if !a.pool.AllowLogin(acc.ID) {
+		log.Printf("wxapp: login budget exhausted for account %d, failing with original error", acc.ID)
 		return nil, err
 	}
+	log.Printf("wxapp: refreshing credentials for account %d", acc.ID)
 	status := a.refreshLiveness(ctx, acc)
+	log.Printf("wxapp: refresh for account %d -> %s", acc.ID, status)
 	switch status {
 	case "alive":
 	case "expired":
@@ -986,7 +992,13 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 }
 
 func (a *App) invokeGetCode(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {
-	return a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	res, err := a.pool.GetCode(ctx, acc.LoginBuffer, appID, acc.ID, a.cfg.TCPProxy)
+	if err == nil {
+		if code, _ := res["code"].(string); code == "" {
+			log.Printf("getCode: empty code for account %d app %s", acc.ID, appID)
+		}
+	}
+	return res, err
 }
 
 func (a *App) invokeGetPhoneNumber(ctx context.Context, acc *store.WechatAccount, appID string, _ map[string]any) (map[string]any, error) {

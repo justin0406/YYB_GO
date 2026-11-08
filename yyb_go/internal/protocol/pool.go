@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -113,6 +114,12 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
 	})
 	if err != nil {
+		// An application -14 is a business refusal, not a session signal —
+		// but it IS a breaker signal, like an empty code: repeated ones mean
+		// this (account, appID) combination keeps being refused upstream.
+		if IsApplicationRequestRejection(err) {
+			p.breaker.recordEmpty(accountID, appID)
+		}
 		// Transport-level failures are not breaker signals (the session
 		// healing path owns them).
 		return nil, err
@@ -215,13 +222,18 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	defer cancel()
 	st, err := p.loginAndSession(loginCtx, loginBuffer, tcpProxy)
 	if err != nil {
+		log.Printf("pool: fresh login for account %d failed: %v", accountID, err)
 		return WmpfSession{}, err
 	}
 	uin := st.Session.UIN
 	_ = p.db.SetAccountUIN(ctx, acc.ID, uin)
 	expiresAt := sessionExpiresAt(st, p.cfg.SessionTTL)
+	log.Printf("pool: fresh login for account %d ok (uin %d), session ttl %v, psk expires at %s",
+		accountID, uin, time.Duration(expiresAt-time.Now().Unix())*time.Second,
+		time.Unix(st.PSK.ExpiredAt, 0).Format("15:04:05"))
 	blob := st.toBlob()
 	if err = p.db.PutSession(ctx, accountID, &uin, blob, expiresAt, tcpProxy); err != nil {
+		log.Printf("pool: put session for account %d failed: %v", accountID, err)
 		return WmpfSession{}, err
 	}
 	return st, nil

@@ -31,8 +31,8 @@ services:
       # 想绑定宿主机目录可改为 - ./resource:/app/resource
       - yyb-resource:/app/resource
     healthcheck:
-      # 镜像里没有 curl/wget，用 bash 内建的 /dev/tcp 探活
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
+      # 注意：必须显式用 bash —— debian-slim 的 /bin/sh 是 dash，不支持 /dev/tcp
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
       interval: 30s
       timeout: 5s
       retries: 3

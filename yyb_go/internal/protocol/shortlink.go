@@ -168,14 +168,67 @@ func parse0RTTResponse(rbody, psk, pskCH, type8, recvKey []byte) ([]byte, []byte
 				continue
 			}
 			if sl, err := parseShortlink(ad); err == nil {
+				if rejection := shortlinkHeaderRejection(sl.Body); rejection != nil {
+					return nil, nil, rejection
+				}
 				if resp, err := sessionDecrypt(sl.Body, recvKey); err == nil {
 					return extractCode(resp), resp, nil
 				}
 			}
 			if resp, err := sessionDecrypt(ad, recvKey); err == nil {
+				if rejection := shortlinkHeaderRejection(resp); rejection != nil {
+					return nil, nil, rejection
+				}
 				return extractCode(resp), resp, nil
 			}
 		}
 	}
 	return nil, nil, fmt.Errorf("%w: AppData decrypt/parse failed", ErrStaleSession)
+}
+
+// ShortlinkRejectedError is an authenticated header rejection without an
+// encrypted application body. The fixed header code carries no request
+// material, so it is safe to surface as-is.
+type ShortlinkRejectedError struct {
+	Code      int64
+	Transport bool
+}
+
+func (e *ShortlinkRejectedError) Error() string {
+	layer := "application"
+	if e.Transport {
+		layer = "transport"
+	}
+	return fmt.Sprintf("shortlink %s rejected: code=%d", layer, e.Code)
+}
+
+// IsApplicationRequestRejection reports whether the error is a bare
+// application-layer rejection (e.g. -14). Such a rejection is frequently seen
+// between two successful calls on the SAME session: it does not mean the
+// session keys are stale, so callers must not delete the session or rotate
+// credentials over it.
+func IsApplicationRequestRejection(err error) bool {
+	var rej *ShortlinkRejectedError
+	if errors.As(err, &rej) {
+		return !rej.Transport
+	}
+	return false
+}
+
+// shortlinkHeaderRejection inspects a fully wpkg-headed body for the result
+// codes the server sets on an authenticated header-only rejection (field 4:
+// transport, field 23: application). It only fires when the body is exactly a
+// header with nothing after it, i.e. there is no encrypted payload to lose.
+func shortlinkHeaderRejection(body []byte) error {
+	fields, _, size, err := decodeWpkgHead(body)
+	if err != nil || size != len(body) {
+		return nil
+	}
+	if code := int64(fields[4]); code != 0 {
+		return &ShortlinkRejectedError{Code: code, Transport: true}
+	}
+	if code := int64(fields[23]); code != 0 {
+		return &ShortlinkRejectedError{Code: code}
+	}
+	return nil
 }
