@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,6 +18,7 @@ const (
 	yybHost         = "https://yybadaccess.3g.qq.com"
 	loginBufferURL  = yybHost + "/pc_yyb_auth/pcyyb_get_wx_login_buffer_auth"
 	refreshTokenURL = yybHost + "/pc_yyb_auth/pcyyb_refresh_token_auth"
+	checkLoginURL   = yybHost + "/pc_yyb/pcyyb_check_login"
 	userInfoURL     = yybHost + "/pc_yyb/pcyyb_get_user_info"
 	loginBusinessID = "pc_yyb_auth"
 	loginAccessKey  = "wgrdg373hy26ww2"
@@ -115,9 +117,45 @@ func (c *LoginBufferClient) FetchLoginBuffer(ctx context.Context, creds LoginBuf
 	return values[0], nil
 }
 
+// RefreshRejectedError is a typed non-zero business answer from the credential
+// endpoints. It still classifies as ErrAuthRejected so existing errors.Is
+// checks keep working, but carries the numeric code for callers that need to
+// distinguish wrapper codes like -109 from a definitive WeChat rejection.
+type RefreshRejectedError struct {
+	Code    int
+	Message string
+}
+
+func (e *RefreshRejectedError) Error() string {
+	return fmt.Sprintf("refresh rejected: code=%d msg=%s", e.Code, e.Message)
+}
+
+func (e *RefreshRejectedError) Is(target error) bool { return target == ErrAuthRejected }
+
 func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginBufferCredentials) (LoginBufferCredentials, error) {
+	refreshed, err := c.requestCredentials(ctx, creds, refreshTokenURL, loginBusinessID, loginAccessKey)
+	var rejected *RefreshRejectedError
+	if errors.As(err, &rejected) && rejected.Code == -109 && ctx.Err() == nil {
+		// -109 is a wrapper, not proof of revocation: the official check-login
+		// endpoint may rotate credentials or expose the underlying WeChat
+		// rejection. Only a confirmed rejection there counts as expired.
+		checked, checkErr := c.requestCredentials(ctx, creds, checkLoginURL, "pc_yyb", "")
+		if checkErr == nil {
+			return checked, nil
+		}
+		if errors.Is(checkErr, ErrAuthRejected) {
+			return LoginBufferCredentials{}, fmt.Errorf("%w; check login: %w", err, checkErr)
+		}
+		// The check itself failed for a non-auth reason (e.g. transport); keep
+		// the auth classification off so the account is not marked expired.
+		return LoginBufferCredentials{}, fmt.Errorf("refresh rejected (code=%d); check login unavailable: %w", rejected.Code, checkErr)
+	}
+	return refreshed, err
+}
+
+func (c *LoginBufferClient) requestCredentials(ctx context.Context, creds LoginBufferCredentials, endpoint, business, key string) (LoginBufferCredentials, error) {
 	if creds.RefreshToken == "" {
-		return LoginBufferCredentials{}, fmt.Errorf("missing refresh token")
+		return LoginBufferCredentials{}, fmt.Errorf("%w: missing refresh token", ErrAuthRejected)
 	}
 	body, err := json.Marshal(refreshTokenRequest{UserInfo: refreshTokenUserInfo{
 		OpenID:       creds.OpenID,
@@ -130,19 +168,25 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 	}
 	ts, nonce := timestampMS(), nonce4()
 	var data map[string]any
-	if err = c.requestJSON(ctx, http.MethodPost, refreshTokenURL, body, map[string]string{
+	if err = c.requestJSON(ctx, http.MethodPost, endpoint, body, map[string]string{
 		"Content-Type":          "application/json",
-		"Ual-Access-Businessid": loginBusinessID,
+		"Ual-Access-Businessid": business,
 		"Ual-Access-Timestamp":  ts,
 		"Ual-Access-Nonce":      nonce,
-		"Ual-Access-Signature":  sign(string(body), nonce, ts, loginAccessKey),
+		"Ual-Access-Signature":  sign(string(body), nonce, ts, key),
 	}, &data); err != nil {
 		return LoginBufferCredentials{}, err
 	}
-	if intFromAny(data["code"]) != 0 {
-		return LoginBufferCredentials{}, fmt.Errorf("%w: refresh failed: code=%v msg=%v", ErrAuthRejected, data["code"], data["msg"])
+	if code := intFromAny(data["code"]); code != 0 {
+		return LoginBufferCredentials{}, &RefreshRejectedError{Code: code, Message: fmt.Sprint(data["msg"])}
 	}
 	info, _ := data["user_info"].(map[string]any)
+	if info == nil {
+		return LoginBufferCredentials{}, fmt.Errorf("credential response missing user_info")
+	}
+	if openID := stringFromMap(info, "open_id"); openID != "" && openID != creds.OpenID {
+		return LoginBufferCredentials{}, fmt.Errorf("credential response account mismatch")
+	}
 	expiresIn := defaultInt64(int64FromMap(info, "expires_in"), 7200)
 	refreshed := creds
 	refreshed.AccessToken = stringFromMap(info, "access_token")
@@ -152,7 +196,7 @@ func (c *LoginBufferClient) RefreshCredentials(ctx context.Context, creds LoginB
 	refreshed.ExpiresIn = expiresIn
 	refreshed.ExpiresAt = time.Now().Unix() + expiresIn
 	if refreshed.AccessToken == "" {
-		return LoginBufferCredentials{}, fmt.Errorf("refresh response missing access_token")
+		return LoginBufferCredentials{}, fmt.Errorf("credential response missing access_token")
 	}
 	return refreshed, nil
 }

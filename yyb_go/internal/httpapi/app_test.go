@@ -242,6 +242,46 @@ func TestHandlerRequiresLogin(t *testing.T) {
 	}
 }
 
+func TestWXAppAppIDPolicy(t *testing.T) {
+	t.Setenv("YYB_CODE_DENY_APPIDS", "wxdeadbeefcafe")
+	app := newTestApp(t, Config{})
+
+	post := func(a *App, appid string) *httptest.ResponseRecorder {
+		body := `{"ref":"1","app_id":"` + appid + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/wxapp/getCode", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		a.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Built-in website-app AppIDs are refused before anything is sent
+	// upstream, with a reason the caller can act on.
+	rec := post(app, "wx5cd60c5d4817a188")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("blocked builtin appid status = %d, want 403", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "网站应用") {
+		t.Fatalf("blocked builtin appid body = %s, want reason", rec.Body.String())
+	}
+	// The env-configured deny list is honored too.
+	if rec := post(app, "wxdeadbeefcafe"); rec.Code != http.StatusForbidden {
+		t.Fatalf("blocked env appid status = %d, want 403", rec.Code)
+	}
+	// Unknown mini-program AppIDs pass the policy layer (they then fail on
+	// account resolution).
+	if rec := post(app, "wx1234567890abcdef"); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown appid status = %d, want 404 (policy must not block it)", rec.Code)
+	}
+
+	// An explicit allow lifts even the built-in refusal.
+	t.Setenv("YYB_CODE_ALLOW_APPIDS", "wx5cd60c5d4817a188")
+	allowed := newTestApp(t, Config{})
+	if rec := post(allowed, "wx5cd60c5d4817a188"); rec.Code != http.StatusNotFound {
+		t.Fatalf("allowed appid status = %d, want 404 (policy must not block it)", rec.Code)
+	}
+}
+
 func TestInvokeWXAppErrorClassification(t *testing.T) {
 	app := newTestApp(t, Config{})
 	ctx := context.Background()

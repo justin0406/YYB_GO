@@ -37,6 +37,11 @@ type Config struct {
 	AvatarTimeout  time.Duration
 	ScanTimeout    time.Duration
 	QRSessionTTL   time.Duration
+	// KeepaliveInterval controls how often credentials are checked for
+	// renewal; KeepaliveAhead how long before expiry a renewal happens.
+	// Zero values fall back to the defaults in keepalive.go.
+	KeepaliveInterval time.Duration
+	KeepaliveAhead    time.Duration
 }
 
 type App struct {
@@ -45,6 +50,7 @@ type App struct {
 	db        *store.DB
 	pool      *protocol.Pool
 	qr        *qr.Client
+	appIDs    *appIDPolicy
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
@@ -52,6 +58,13 @@ type App struct {
 	// sessions holds browser login sessions: cookie value → expiry.
 	sessMu   sync.Mutex
 	sessions map[string]time.Time
+
+	// refreshLocks serializes credential refreshes per account; kaRetry
+	// holds keepalive retry deadlines after non-verdict failures.
+	refreshMu    sync.Mutex
+	refreshLocks map[int64]*sync.Mutex
+	kaMu         sync.Mutex
+	kaRetry      map[int64]time.Time
 
 	stopPurge chan struct{}
 	purgeDone chan struct{}
@@ -93,6 +106,12 @@ func NewApp(cfg Config) (*App, error) {
 	if cfg.QRSessionTTL == 0 {
 		cfg.QRSessionTTL = 5 * time.Minute
 	}
+	if cfg.KeepaliveInterval == 0 {
+		cfg.KeepaliveInterval = defaultKeepaliveInterval
+	}
+	if cfg.KeepaliveAhead == 0 {
+		cfg.KeepaliveAhead = defaultKeepaliveAhead
+	}
 	res, err := ensureResources(cfg.ResourceRoot)
 	if err != nil {
 		return nil, err
@@ -111,15 +130,18 @@ func NewApp(cfg Config) (*App, error) {
 	poolCfg.TCPProxy = cfg.TCPProxy
 	pool := protocol.NewPool(poolCfg, db)
 	app := &App{
-		cfg:        cfg,
-		resources:  res,
-		db:         db,
-		pool:       pool,
-		qr:         qr.NewClient(cfg.RequestTimeout),
-		qrSessions: map[string]*qr.Session{},
-		sessions:   map[string]time.Time{},
-		stopPurge:  make(chan struct{}),
-		purgeDone:  make(chan struct{}),
+		cfg:          cfg,
+		resources:    res,
+		db:           db,
+		pool:         pool,
+		qr:           qr.NewClient(cfg.RequestTimeout),
+		appIDs:       newAppIDPolicy(),
+		qrSessions:   map[string]*qr.Session{},
+		sessions:     map[string]time.Time{},
+		refreshLocks: map[int64]*sync.Mutex{},
+		kaRetry:      map[int64]time.Time{},
+		stopPurge:    make(chan struct{}),
+		purgeDone:    make(chan struct{}),
 	}
 	app.startPurger()
 	return app, nil
@@ -138,9 +160,9 @@ func (a *App) Close() error {
 	return nil
 }
 
-// startPurger drops expired session rows (reads already skip them, but the
-// rows would otherwise accumulate) and stale QR sessions once at startup and
-// then every hour until Close.
+// startBackground runs the two background loops — hourly housekeeping
+// (expired session rows, stale QR sessions) and the keepalive credential
+// renewal — until Close.
 func (a *App) startPurger() {
 	purgeOnce := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -152,17 +174,27 @@ func (a *App) startPurger() {
 		}
 		a.pruneQR()
 	}
+	keepaliveOnce := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		a.keepaliveTick(ctx)
+	}
 	purgeOnce()
+	keepaliveOnce()
 	go func() {
 		defer close(a.purgeDone)
-		ticker := time.NewTicker(time.Hour)
-		defer ticker.Stop()
+		purge := time.NewTicker(time.Hour)
+		keepalive := time.NewTicker(a.cfg.KeepaliveInterval)
+		defer purge.Stop()
+		defer keepalive.Stop()
 		for {
 			select {
 			case <-a.stopPurge:
 				return
-			case <-ticker.C:
+			case <-purge.C:
 				purgeOnce()
+			case <-keepalive.C:
+				keepaliveOnce()
 			}
 		}
 	}()
@@ -586,6 +618,8 @@ func (a *App) handleAccountsRoot(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Sessions cascade with the row; drop the in-memory breaker state too.
+		a.pool.CircuitForget(acc.ID)
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": acc.ID, "openid": acc.OpenID})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -727,6 +761,10 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		writeError(w, http.StatusBadRequest, "payload is required")
 		return
 	}
+	if reason := a.appIDs.check(body.AppID); reason != "" {
+		writeError(w, http.StatusForbidden, "app_id 被拒绝："+reason)
+		return
+	}
 	acc, ok := a.resolveAccountRef(w, r, body.Ref)
 	if !ok {
 		return
@@ -737,6 +775,15 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 		switch {
 		case errors.As(err, &expired):
 			writeError(w, http.StatusConflict, "account login_buffer expired (refresh failed); re-scan required")
+		case errors.Is(err, protocol.ErrCircuitOpen):
+			// Local refusal: upstream kept refusing this combination, so the
+			// request never left the service. Retry-After matches the longer
+			// of the two cooldowns.
+			w.Header().Set("Retry-After", "900")
+			writeError(w, http.StatusTooManyRequests, err.Error())
+		case errors.Is(err, protocol.ErrPacingRefused):
+			w.Header().Set("Retry-After", "3")
+			writeError(w, http.StatusTooManyRequests, err.Error())
 		default:
 			writeError(w, http.StatusBadGateway, "call failed: "+err.Error())
 		}
@@ -835,6 +882,15 @@ func (a *App) storeFromScan(ctx context.Context, loginBuffer string, creds proto
 }
 
 func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) string {
+	// Serialize per account and re-read first: a scheduled keepalive renewal
+	// and an error-triggered refresh must not race on the same rotating
+	// refresh token, and the caller's snapshot may already be stale.
+	lock := a.refreshLockFor(acc.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if fresh, err := a.db.GetAccount(ctx, acc.ID); err == nil && fresh != nil {
+		acc = fresh
+	}
 	if acc.Credentials == nil {
 		_ = a.db.SetAccountStatus(ctx, acc.ID, "unknown")
 		return "unknown"
@@ -885,6 +941,11 @@ func (e accountExpiredError) Error() string { return "account expired: " + e.ope
 //   - ErrAuthRejected: the server rejected the login_buffer; refresh the
 //     token + login_buffer, then retry.
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
+	// Shape traffic per account before anything touches the upstream; a
+	// refusal here is a local 429 and never changes account state.
+	if err := a.pool.Pace(ctx, acc.ID); err != nil {
+		return nil, err
+	}
 	result, err := call(ctx, acc, appID, payload)
 	if err == nil {
 		return result, nil
@@ -902,6 +963,12 @@ func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID s
 			return nil, retryErr
 		}
 		err = retryErr
+	}
+	// The forced credential refresh is an OAuth-layer call: once the account
+	// has exhausted its login budget, fail with the original error instead of
+	// provoking the upstream again. The window slides, a later call heals.
+	if !a.pool.AllowLogin(acc.ID) {
+		return nil, err
 	}
 	status := a.refreshLiveness(ctx, acc)
 	switch status {

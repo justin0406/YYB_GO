@@ -53,6 +53,9 @@ type Pool struct {
 
 	loginSem     chan struct{}
 	shortlinkSem chan struct{}
+	budget       *loginBudget
+	pace         *pacingGate
+	breaker      *circuit
 }
 
 func NewPool(cfg Config, db *store.DB) *Pool {
@@ -81,11 +84,19 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 		locks:        map[string]*sync.Mutex{},
 		loginSem:     make(chan struct{}, cfg.MaxLoginConcurrency),
 		shortlinkSem: make(chan struct{}, cfg.MaxShortlinkConcurrency),
+		budget:       newLoginBudget(DefaultLoginBudget, DefaultLoginWindow),
+		pace:         newPacingGate(),
+		breaker:      newCircuit(),
 	}
 }
 
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
-	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
+	// The breaker is checked before anything is sent: an open circuit returns
+	// a local refusal instead of hammering a combination that keeps failing.
+	if !p.breaker.allow(accountID, appID) {
+		return nil, fmt.Errorf("%w for account %d app %s: repeated empty codes; cooling down, retry later", ErrCircuitOpen, accountID, appID)
+	}
+	res, err := p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
 		hostAppID := st.Session.HostAppID
 		if len(hostAppID) == 0 {
 			hostAppID = hostAppIDDefault
@@ -101,6 +112,17 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		}
 		return map[string]any{"code": string(code), "errMsg": "login:ok"}, nil
 	})
+	if err != nil {
+		// Transport-level failures are not breaker signals (the session
+		// healing path owns them).
+		return nil, err
+	}
+	if code, _ := res["code"].(string); code == "" {
+		p.breaker.recordEmpty(accountID, appID)
+	} else {
+		p.breaker.recordSuccess(accountID, appID)
+	}
+	return res, nil
 }
 
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
@@ -177,6 +199,13 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	acc, err := p.db.GetAccount(ctx, accountID)
 	if err != nil {
 		return WmpfSession{}, err
+	}
+	// A fresh ManualAuth is an OAuth-layer call; once the account has used up
+	// its sliding-window budget, refuse locally instead of provoking the
+	// upstream again.
+	if !p.AllowLogin(accountID) {
+		return WmpfSession{}, fmt.Errorf("%w for account %d: too many OAuth logins in %v; retry later",
+			ErrLoginBudgetExhausted, accountID, DefaultLoginWindow)
 	}
 	if err = acquire(ctx, p.loginSem); err != nil {
 		return WmpfSession{}, err

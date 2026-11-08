@@ -40,15 +40,22 @@ func readVarint(data []byte, i int) (uint64, int, error) {
 	return 0, i, fmt.Errorf("truncated varint")
 }
 
+// pbTag encodes a protobuf tag as a varint. Tags are (field<<3)|wiretype, and
+// field numbers >= 16 no longer fit in a single byte — a single-byte encoding
+// would silently truncate them.
+func pbTag(field int, wire byte) []byte {
+	return varint(uint64(field)<<3 | uint64(wire))
+}
+
 func pbLen(field int, data []byte) []byte {
-	out := []byte{byte((field << 3) | 2)}
+	out := pbTag(field, 2)
 	out = append(out, varint(uint64(len(data)))...)
 	out = append(out, data...)
 	return out
 }
 
 func pbVar(field int, n uint64) []byte {
-	out := []byte{byte((field << 3) | 0)}
+	out := pbTag(field, 0)
 	out = append(out, varint(n)...)
 	return out
 }
