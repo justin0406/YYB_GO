@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     UNIQUE(wechat_account_id, tcp_proxy)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 `
 
 type DB struct {
@@ -318,6 +323,29 @@ func (db *DB) PutSession(ctx context.Context, accountID int64, uin *int64, sessi
 func (db *DB) InvalidateSession(ctx context.Context, accountID int64, tcpProxy string) error {
 	_, err := db.sql.ExecContext(ctx, "DELETE FROM sessions WHERE wechat_account_id=? AND tcp_proxy=?", accountID, tcpProxy)
 	return err
+}
+
+func (db *DB) GetSetting(ctx context.Context, key string) (string, error) {
+	var v string
+	err := db.sql.QueryRowContext(ctx, "SELECT value FROM settings WHERE key=?", key).Scan(&v)
+	return v, err
+}
+
+func (db *DB) SetSetting(ctx context.Context, key, value string) error {
+	_, err := db.sql.ExecContext(ctx,
+		"INSERT INTO settings(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+		key, value)
+	return err
+}
+
+// EnsureSetting stores value under key when absent and returns the stored
+// value, so concurrent creators converge on the first write.
+func (db *DB) EnsureSetting(ctx context.Context, key, value string) (string, error) {
+	if _, err := db.sql.ExecContext(ctx,
+		"INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)", key, value); err != nil {
+		return "", err
+	}
+	return db.GetSetting(ctx, key)
 }
 
 func (db *DB) PurgeExpiredSessions(ctx context.Context) (int64, error) {

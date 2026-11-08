@@ -43,6 +43,10 @@ type WmpfSession struct {
 	ShortlinkTargets []Target
 	CreatedAt        time.Time
 	TCPProxy         string
+	// SessDevice is the stable per-account session device this session was
+	// established with; JSAPI requests must keep presenting it. Empty means
+	// the session predates stable identities and callers fall back random.
+	SessDevice []byte
 }
 
 type Pool struct {
@@ -57,6 +61,9 @@ type Pool struct {
 	budget       *loginBudget
 	pace         *pacingGate
 	breaker      *circuit
+
+	deviceSeedMu    sync.Mutex
+	deviceSeedValue []byte
 }
 
 func NewPool(cfg Config, db *store.DB) *Pool {
@@ -91,6 +98,15 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 	}
 }
 
+// sessDevice returns the stable session device of the session, falling back
+// to a fresh random one for sessions created before stable identities.
+func (st WmpfSession) sessDevice() []byte {
+	if len(st.SessDevice) != 0 {
+		return st.SessDevice
+	}
+	return randomSessDevice()
+}
+
 func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
 	// The breaker is checked before anything is sent: an open circuit returns
 	// a local refusal instead of hammering a combination that keeps failing.
@@ -102,7 +118,7 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 		if len(hostAppID) == 0 {
 			hostAppID = hostAppIDDefault
 		}
-		plain := buildJSAPIPlaintext(st.Session.UIN, appID, jsLoginURL, jsLoginCmdID, nil, hostAppID, nil)
+		plain := buildJSAPIPlaintext(st.Session.UIN, appID, jsLoginURL, jsLoginCmdID, nil, hostAppID, st.sessDevice())
 		envelope, err := buildTransferPacket(st.Session, plain)
 		if err != nil {
 			return nil, err
@@ -134,7 +150,7 @@ func (p *Pool) GetCode(ctx context.Context, loginBuffer, appID string, accountID
 
 func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, accountID int64, tcpProxy string) (map[string]any, error) {
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		plain := buildPhoneRequest(st.Session.UIN, appID)
+		plain := buildPhoneRequest(st.Session.UIN, appID, st.sessDevice())
 		envelope, err := buildTransferPacket(st.Session, plain)
 		if err != nil {
 			return nil, err
@@ -149,7 +165,7 @@ func (p *Pool) GetPhoneNumber(ctx context.Context, loginBuffer, appID string, ac
 
 func (p *Pool) OperateWXData(ctx context.Context, loginBuffer, appID string, payload map[string]any, accountID int64, tcpProxy string) (map[string]any, error) {
 	return p.run(ctx, loginBuffer, accountID, tcpProxy, func(ctx context.Context, st WmpfSession) (map[string]any, error) {
-		plain, err := buildOperateRequest(st.Session.UIN, appID, payload)
+		plain, err := buildOperateRequest(st.Session.UIN, appID, payload, st.sessDevice())
 		if err != nil {
 			return nil, err
 		}
@@ -207,6 +223,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	if err != nil {
 		return WmpfSession{}, err
 	}
+	dev := p.deviceFor(ctx, acc.OpenID, acc.ID)
 	// A fresh ManualAuth is an OAuth-layer call; once the account has used up
 	// its sliding-window budget, refuse locally instead of provoking the
 	// upstream again.
@@ -220,7 +237,7 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	defer release(p.loginSem)
 	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
 	defer cancel()
-	st, err := p.loginAndSession(loginCtx, loginBuffer, tcpProxy)
+	st, err := p.loginAndSession(loginCtx, loginBuffer, dev, tcpProxy)
 	if err != nil {
 		log.Printf("pool: fresh login for account %d failed: %v", accountID, err)
 		return WmpfSession{}, err
@@ -253,7 +270,7 @@ func (p *Pool) lockFor(key string) *sync.Mutex {
 	return l
 }
 
-func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string) (WmpfSession, error) {
+func (p *Pool) loginAndSession(ctx context.Context, loginBuffer string, dev DeviceIdentity, tcpProxy string) (WmpfSession, error) {
 	if loginBuffer == "" {
 		return WmpfSession{}, fmt.Errorf("login_buffer is empty")
 	}
@@ -268,7 +285,7 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	targets = orderLonglinkTargets(targets, 6)
 	var last error
 	for _, t := range targets {
-		st, err := p.loginViaTarget(ctx, t, loginBuffer, meta, tcpProxy)
+		st, err := p.loginViaTarget(ctx, t, loginBuffer, meta, dev, tcpProxy)
 		if err == nil {
 			return st, nil
 		}
@@ -280,16 +297,22 @@ func (p *Pool) loginAndSession(ctx context.Context, loginBuffer, tcpProxy string
 	return WmpfSession{}, fmt.Errorf("all LongLink candidates failed: %w", last)
 }
 
-func (p *Pool) loginViaTarget(ctx context.Context, t Target, loginBuffer string, meta loginMeta, tcpProxy string) (WmpfSession, error) {
+func (p *Pool) loginViaTarget(ctx context.Context, t Target, loginBuffer string, meta loginMeta, dev DeviceIdentity, tcpProxy string) (WmpfSession, error) {
 	mc, err := connectMmtls(ctx, t, p.cfg.LoginTimeout, tcpProxy, p.cfg.TCPProxyFallbackDirect)
 	if err != nil {
 		return WmpfSession{}, err
 	}
 	defer mc.close()
 
-	appDeviceID, err := randomAppDeviceID()
-	if err != nil {
-		return WmpfSession{}, err
+	// A stable per-account device identity reads as the same machine
+	// re-authorizing; fall back to the historical random behavior when the
+	// identity is unavailable.
+	appDeviceID := dev.AppDeviceID
+	if len(appDeviceID) == 0 {
+		appDeviceID, err = randomAppDeviceID()
+		if err != nil {
+			return WmpfSession{}, err
+		}
 	}
 	temp := &manualAuthTemp{}
 	body, err := buildLoginBody(loginBuffer, meta.DeviceID, appDeviceID, temp)
@@ -331,6 +354,7 @@ func (p *Pool) loginViaTarget(ctx context.Context, t Target, loginBuffer string,
 		ShortlinkTargets: shortTargets,
 		CreatedAt:        time.Now(),
 		TCPProxy:         tcpProxy,
+		SessDevice:       dev.SessDevice,
 	}, nil
 }
 
@@ -384,13 +408,14 @@ func sessionExpiresAt(st WmpfSession, ttl time.Duration) int64 {
 func (st WmpfSession) toBlob() map[string]any {
 	return map[string]any{
 		"session": map[string]any{
-			"send_key":   encBytes(st.Session.SendKey),
-			"recv_key":   encBytes(st.Session.RecvKey),
-			"f9":         encBytes(st.Session.F9),
-			"uin":        st.Session.UIN,
-			"ticket":     encBytes(st.Session.Ticket),
-			"device_id":  encBytes(st.Session.DeviceID),
-			"host_appid": encBytes(st.Session.HostAppID),
+			"send_key":    encBytes(st.Session.SendKey),
+			"recv_key":    encBytes(st.Session.RecvKey),
+			"f9":          encBytes(st.Session.F9),
+			"uin":         st.Session.UIN,
+			"ticket":      encBytes(st.Session.Ticket),
+			"device_id":   encBytes(st.Session.DeviceID),
+			"host_appid":  encBytes(st.Session.HostAppID),
+			"sess_device": encBytes(st.SessDevice),
 		},
 		"psk_entry":         st.PSK,
 		"shortlink_targets": targetsToAny(st.ShortlinkTargets),
@@ -417,6 +442,9 @@ func sessionFromBlob(blob map[string]any) (WmpfSession, error) {
 			DeviceID:  decBytes(sm["device_id"]),
 			HostAppID: decBytes(sm["host_appid"]),
 		},
+		// Sessions created before stable identities carry no sess_device;
+		// st.sessDevice() falls back to the historical random behavior.
+		SessDevice: decBytes(sm["sess_device"]),
 		PSK: pskEntry{
 			PSKType:      int(int64FromAny(pm["psk_type"])),
 			PreSharedKey: stringAny(pm["pre_shared_key"]),

@@ -490,8 +490,10 @@ func parseRawResponse(codeOrJSON, resp []byte) map[string]any {
 	return protobufToMap(resp)
 }
 
-func buildPhoneRequest(uin int64, appID string) []byte {
-	sessDevice := randomSessDevice()
+func buildPhoneRequest(uin int64, appID string, sessDevice []byte) []byte {
+	if len(sessDevice) == 0 {
+		sessDevice = randomSessDevice()
+	}
 	aid := []byte(appID)
 	body := make([]byte, 0, 140)
 	body = append(body, pbLen(1, sessionInfo(uint32(uin), unifiedPCWindows, sessDevice))...)
@@ -503,9 +505,11 @@ func buildPhoneRequest(uin int64, appID string) []byte {
 	return buildJSAPIPlaintext(uin, appID, phoneURL, phoneCmdID, body, nil, sessDevice)
 }
 
-func buildOperateRequest(uin int64, appID string, payload map[string]any) ([]byte, error) {
+func buildOperateRequest(uin int64, appID string, payload map[string]any, sessDevice []byte) ([]byte, error) {
 	payload = extractOperatePayload(payload)
-	sessDevice := randomSessDevice()
+	if len(sessDevice) == 0 {
+		sessDevice = randomSessDevice()
+	}
 	aid := []byte(appID)
 	f3, err := json.Marshal(payload)
 	if err != nil {
