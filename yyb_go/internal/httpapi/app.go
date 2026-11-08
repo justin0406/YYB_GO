@@ -942,6 +942,12 @@ func (e accountExpiredError) Error() string { return "account expired: " + e.ope
 //   - ErrAuthRejected: the server rejected the login_buffer; refresh the
 //     token + login_buffer, then retry.
 func (a *App) invokeWXApp(ctx context.Context, acc *store.WechatAccount, appID string, payload map[string]any, call wxappCall) (map[string]any, error) {
+	// An account already judged expired is never touched upstream: every
+	// login/refresh attempt against a revoked authorization just deepens the
+	// risk-control shadow. Recovery paths are /accounts/refresh and re-scan.
+	if acc.Status != nil && *acc.Status == "expired" {
+		return nil, accountExpiredError{openid: acc.OpenID}
+	}
 	// Shape traffic per account before anything touches the upstream; a
 	// refusal here is a local 429 and never changes account state.
 	if err := a.pool.Pace(ctx, acc.ID); err != nil {

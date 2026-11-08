@@ -282,6 +282,35 @@ func TestWXAppAppIDPolicy(t *testing.T) {
 	}
 }
 
+func TestInvokeWXAppExpiredShortCircuit(t *testing.T) {
+	app := newTestApp(t, Config{})
+	ctx := context.Background()
+	acc, err := app.db.UpsertAccount(ctx, "openid-expired", "buffer", nil, nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("UpsertAccount() error = %v", err)
+	}
+	if err := app.db.SetAccountStatus(ctx, acc.ID, "expired"); err != nil {
+		t.Fatalf("SetAccountStatus() error = %v", err)
+	}
+	// Reload like the HTTP handler does: the status lives in the DB row.
+	acc, err = app.db.GetAccount(ctx, acc.ID)
+	if err != nil {
+		t.Fatalf("GetAccount() error = %v", err)
+	}
+	calls := 0
+	_, err = app.invokeWXApp(ctx, acc, "wxapp", nil, func(context.Context, *store.WechatAccount, string, map[string]any) (map[string]any, error) {
+		calls++
+		return nil, nil
+	})
+	var expiredErr accountExpiredError
+	if !errors.As(err, &expiredErr) {
+		t.Fatalf("invokeWXApp() error = %v, want accountExpiredError", err)
+	}
+	if calls != 0 {
+		t.Fatalf("expired account must not be touched upstream, calls = %d", calls)
+	}
+}
+
 func TestInvokeWXAppErrorClassification(t *testing.T) {
 	app := newTestApp(t, Config{})
 	ctx := context.Background()
