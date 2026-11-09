@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -425,10 +427,34 @@ func scanSession(row accountScanner) (*SessionRow, error) {
 	if uin.Valid {
 		s.UIN = &uin.Int64
 	}
-	if err := json.Unmarshal([]byte(blob), &s.SessionBlob); err != nil {
+	decoded, err := decodeSessionBlob(blob)
+	if err != nil {
 		return nil, fmt.Errorf("decode session_blob: %w", err)
 	}
+	s.SessionBlob = decoded
 	return &s, nil
+}
+
+// decodeSessionBlob decodes a stored session blob without losing integer
+// precision. A plain json.Unmarshal turns JSON numbers into float64, which
+// cannot represent a WeChat UIN (it exceeds 2^53), so the cached session would
+// carry a different identity from the one ManualAuth established. The first
+// request after a fresh login uses the in-memory value and succeeds, while
+// every later request re-reads this cache and presents the rounded UIN in the
+// WPKG header and JSAPI session info — which the upstream answers with
+// "shortlink application -14". json.Number keeps the exact decimal text and
+// the protocol package already converts it exactly in int64FromAny.
+func decodeSessionBlob(raw string) (map[string]any, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var blob map[string]any
+	if err := dec.Decode(&blob); err != nil {
+		return nil, err
+	}
+	if tok, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("unexpected trailing JSON token %v", tok)
+	}
+	return blob, nil
 }
 
 func marshalNullable(v map[string]any) (sql.NullString, error) {
