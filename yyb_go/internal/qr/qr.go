@@ -27,6 +27,8 @@ const (
 	callbackURL  = "https://yybadaccess.3g.qq.com/pc_yyb/pcyyb_oauth"
 	qrBase       = "https://open.weixin.qq.com/connect/qrcode/"
 	longPollBase = "https://long.open.weixin.qq.com/connect/l/qrconnect"
+	// longPollWait is how long the upstream long poll is allowed to block.
+	longPollWait = 35 * time.Second
 )
 
 var (
@@ -157,14 +159,18 @@ func (c *Client) PollQRCode(ctx context.Context, sess *Session) (PollResult, err
 		"uuid": {sess.WXUUID},
 		"_":    {strconv.FormatInt(time.Now().UnixMilli(), 10)},
 	}.Encode()
-	reqCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, longPollWait+5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return PollResult{}, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := sess.HTTPClient.Do(req)
+	// The long poll blocks upstream for up to longPollWait, so it needs its own
+	// client deadline: the session client is built with the much shorter shared
+	// request timeout and would abort every poll before the server answers.
+	pollClient := &http.Client{Timeout: longPollWait + 5*time.Second, Jar: sess.HTTPClient.Jar}
+	resp, err := pollClient.Do(req)
 	if err != nil {
 		return PollResult{}, err
 	}
