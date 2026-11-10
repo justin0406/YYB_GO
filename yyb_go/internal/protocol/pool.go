@@ -62,6 +62,8 @@ type Pool struct {
 	pace         *pacingGate
 	breaker      *circuit
 
+	loginBuffers *LoginBufferClient
+
 	deviceSeedMu    sync.Mutex
 	deviceSeedValue []byte
 }
@@ -95,7 +97,29 @@ func NewPool(cfg Config, db *store.DB) *Pool {
 		budget:       newLoginBudget(DefaultLoginBudget, DefaultLoginWindow),
 		pace:         newPacingGate(),
 		breaker:      newCircuit(),
+		loginBuffers: NewLoginBufferClient(cfg.ShortlinkTimeout),
 	}
+}
+
+// freshLoginBuffer mints a new login_buffer ticket from the account's current
+// access token, falling back to the stored buffer when that is impossible
+// (no credentials, expired token, transport error). The mint is a read-only
+// call: it does not rotate the OAuth credential pair and is not counted
+// against the login budget.
+func (p *Pool) freshLoginBuffer(ctx context.Context, acc *store.WechatAccount, stored string) string {
+	if acc == nil || acc.Credentials == nil || p.loginBuffers == nil {
+		return stored
+	}
+	creds := CredentialsFromMap(acc.Credentials)
+	if creds.AccessToken == "" {
+		return stored
+	}
+	lb, err := p.loginBuffers.FetchLoginBuffer(ctx, creds)
+	if err != nil {
+		log.Printf("pool: mint fresh login_buffer for account %d failed, using stored: %v", acc.ID, err)
+		return stored
+	}
+	return lb
 }
 
 // sessDevice returns the stable session device of the session, falling back
@@ -237,7 +261,13 @@ func (p *Pool) state(ctx context.Context, loginBuffer string, accountID int64, t
 	defer release(p.loginSem)
 	loginCtx, cancel := context.WithTimeout(ctx, p.cfg.LoginTimeout)
 	defer cancel()
-	st, err := p.loginAndSession(loginCtx, loginBuffer, dev, tcpProxy)
+	// The stored login_buffer ticket lives far shorter (~10-12 min) than the
+	// token pair, so a ManualAuth with the stored one is routinely refused
+	// ("ManualAuthResponse missing session block"). Mint a fresh ticket from
+	// the current access token first: that call only reads, it neither
+	// rotates credentials nor counts as an OAuth login.
+	freshBuffer := p.freshLoginBuffer(loginCtx, acc, loginBuffer)
+	st, err := p.loginAndSession(loginCtx, freshBuffer, dev, tcpProxy)
 	if err != nil {
 		log.Printf("pool: fresh login for account %d failed: %v", accountID, err)
 		return WmpfSession{}, err

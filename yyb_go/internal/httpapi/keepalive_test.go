@@ -16,21 +16,24 @@ func TestCredentialsDue(t *testing.T) {
 	if !credentialsDue(creds, now, 4*time.Minute) {
 		t.Fatalf("expiring within ahead must be due")
 	}
-	// Fresh token pair AND fresh login_buffer: not due.
+	// An hour of token left: not due, whatever the login_buffer age — the
+	// buffer is renewed at login time, not on this schedule.
 	creds.ExpiresAt = now.Add(time.Hour).Unix()
 	creds.RefreshedAt = now.Add(-time.Minute).Unix()
 	if credentialsDue(creds, now, 4*time.Minute) {
 		t.Fatalf("credential with an hour left must not be due")
 	}
-	// The login_buffer ticket dies far sooner than the token pair: an old
-	// refresh timestamp makes the record due even with hours of token left.
-	creds.RefreshedAt = now.Add(-16 * time.Minute).Unix()
-	if !credentialsDue(creds, now, 4*time.Minute) {
-		t.Fatalf("stale login_buffer must be due")
+	creds.RefreshedAt = now.Add(-2 * time.Hour).Unix()
+	if credentialsDue(creds, now, 4*time.Minute) {
+		t.Fatalf("stale login_buffer must not drive credential rotation")
 	}
-	// Legacy records without a timestamp get refreshed once to stamp it.
+	// Legacy records without a timestamp still follow the token clock.
 	creds.RefreshedAt = 0
+	if credentialsDue(creds, now, 4*time.Minute) {
+		t.Fatalf("legacy record with an hour of token left must not be due")
+	}
+	creds.ExpiresAt = now.Add(time.Minute).Unix()
 	if !credentialsDue(creds, now, 4*time.Minute) {
-		t.Fatalf("legacy record without refresh timestamp must be due")
+		t.Fatalf("legacy record near expiry must be due")
 	}
 }

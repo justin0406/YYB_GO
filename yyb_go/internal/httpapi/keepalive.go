@@ -23,28 +23,22 @@ const (
 	defaultKeepaliveAhead    = 4 * time.Minute
 	keepaliveRetryBackoff    = 5 * time.Minute
 	keepaliveMinTimeout      = 30 * time.Second
-	// loginBufferMaxAge: the login_buffer ticket is observed to die far
-	// sooner than the 2h token pair (first ManualAuth with an older buffer
-	// is rejected), and the refresh endpoint itself rejects renewals spaced
-	// less than ~10-13 minutes apart (13min apart observed OK, 9min apart
-	// observed rejected). 15 minutes sits safely above that window.
-	loginBufferMaxAge = 15 * time.Minute
 )
 
 // credentialsDue reports whether the account's credentials should be renewed
-// now: either the token pair is close to expiry, or the login_buffer behind
-// it is older than its observed usable lifetime.
+// now: the token pair is close to expiry.
+//
+// Renewal is driven by the token pair alone. The login_buffer ticket dies far
+// sooner (~10-12 min), but that is handled at login time by minting a fresh
+// ticket from the current access token (Pool.freshLoginBuffer) — a read-only
+// call. Refreshing credentials on a buffer schedule instead would rotate the
+// OAuth pair many times a day for no benefit, and the refresh endpoint
+// rejects renewals spaced under ~10-13 minutes apart anyway.
 func credentialsDue(creds protocol.LoginBufferCredentials, now time.Time, ahead time.Duration) bool {
 	if creds.AccessToken == "" || creds.ExpiresAt == 0 {
 		return false
 	}
-	if now.Add(ahead).Unix() >= creds.ExpiresAt {
-		return true
-	}
-	if creds.RefreshedAt <= 0 {
-		return true // legacy record without a timestamp: refresh once to stamp it
-	}
-	return now.Unix()-creds.RefreshedAt >= int64(loginBufferMaxAge.Seconds())
+	return now.Add(ahead).Unix() >= creds.ExpiresAt
 }
 
 func (a *App) keepaliveTick(ctx context.Context) {
