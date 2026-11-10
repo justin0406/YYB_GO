@@ -19,12 +19,20 @@ services:
     # build: .
     container_name: yyb-go
     restart: unless-stopped
+    # 最小权限：服务只需要网络和挂载卷，不需要任何 Linux capability
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       # 对外暴露；仅本机使用可改成 "127.0.0.1:8000:8000"
       - "8000:8000"
     environment:
       YYB_AUTH_USER: "admin" # 登录用户名
       YYB_AUTH_PASSWORD: "change-me-please" # 必改：openssl rand -hex 16
+      # 掉线通知（可选）：账号授权被微信拒绝时推一次，按授权去重
+      # YYB_NOTIFY_CHANNEL: "serverchan"  # serverchan / pushplus / wecom
+      # YYB_NOTIFY_TOKEN: "SCTxxxxx"      # 对应渠道的 SendKey / token / webhook key
       TZ: Asia/Shanghai
     volumes:
       # SQLite 数据库（resource/db/yyb.db）、二维码、头像都在这个卷里；

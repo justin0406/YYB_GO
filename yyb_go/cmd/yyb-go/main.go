@@ -32,6 +32,16 @@ func main() {
 		log.Printf("WARNING: no login password configured; /qr, /accounts and /wxapp are UNPROTECTED. Set -auth-password or YYB_AUTH_PASSWORD when exposing this service beyond localhost.")
 	}
 
+	notifyChannel := strings.TrimSpace(os.Getenv("YYB_NOTIFY_CHANNEL"))
+	notifyToken := strings.TrimSpace(os.Getenv("YYB_NOTIFY_TOKEN"))
+	if notifyChannel != "" && notifyToken == "" {
+		log.Printf("WARNING: YYB_NOTIFY_CHANNEL is set but YYB_NOTIFY_TOKEN is empty; notifications disabled.")
+		notifyChannel = ""
+	}
+	if notifyChannel != "" {
+		log.Printf("offline notifications enabled via %s", notifyChannel)
+	}
+
 	cfg := httpapi.Config{
 		ResourceRoot:   *resourceRoot,
 		DBFilename:     *dbFilename,
@@ -41,8 +51,10 @@ func main() {
 		SessionTTL:     30 * time.Minute,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,
-		ScanTimeout:    180 * time.Second,
 		QRSessionTTL:   5 * time.Minute,
+		NotifyChannel:  notifyChannel,
+		NotifyToken:    notifyToken,
+		NotifyTopic:    strings.TrimSpace(os.Getenv("YYB_NOTIFY_TOPIC")),
 	}
 
 	app, err := httpapi.NewApp(cfg)

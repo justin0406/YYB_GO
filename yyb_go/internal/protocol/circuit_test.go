@@ -1,9 +1,44 @@
 package protocol
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestShortlinkHeaderRejection(t *testing.T) {
+	// A header-only wpkg body: field 23 = -14 is an authenticated application
+	// rejection, which must classify as such and must NOT be treated as a
+	// stale session (that misclassification deleted healthy sessions).
+	headerOnly := wpkgHead(map[int]uint64{1: 1, 23: negVarint(-14)}, nil)
+	if err := shortlinkHeaderRejection(headerOnly); err == nil {
+		t.Fatalf("header with field 23 = -14 must be a rejection")
+	} else {
+		if !IsApplicationRequestRejection(err) {
+			t.Fatalf("field 23 rejection must be an application rejection, got %v", err)
+		}
+		var rej *ShortlinkRejectedError
+		if !errors.As(err, &rej) || rej.Code != -14 || rej.Transport {
+			t.Fatalf("rejection = %#v, want application code -14", rej)
+		}
+	}
+
+	// Field 4 is the transport layer.
+	transport := wpkgHead(map[int]uint64{1: 1, 4: negVarint(-6)}, nil)
+	if err := shortlinkHeaderRejection(transport); err == nil || IsApplicationRequestRejection(err) {
+		t.Fatalf("field 4 must be a transport rejection, got %v", err)
+	}
+
+	// A clean header with an encrypted body after it is not a rejection.
+	clean := append(wpkgHead(map[int]uint64{1: 1}, nil), 0xde, 0xad, 0xbe, 0xef)
+	if err := shortlinkHeaderRejection(clean); err != nil {
+		t.Fatalf("header followed by payload must not be a rejection, got %v", err)
+	}
+	// A body without a decodable header is not a rejection either.
+	if err := shortlinkHeaderRejection([]byte{0xff, 0xff}); err != nil {
+		t.Fatalf("garbage must not be a rejection, got %v", err)
+	}
+}
 
 func TestPacingReserve(t *testing.T) {
 	g := newPacingGate()
@@ -99,3 +134,7 @@ func TestCircuitBreaker(t *testing.T) {
 		t.Fatalf("target still cooled after cooldown expired")
 	}
 }
+
+// negVarint renders a negative int64 the way protobuf encodes it (10-byte
+// two's complement varint), which is what the upstream puts in wpkg fields.
+func negVarint(v int64) uint64 { return uint64(v) }

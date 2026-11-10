@@ -35,13 +35,18 @@ type Config struct {
 	SessionTTL     time.Duration
 	RequestTimeout time.Duration
 	AvatarTimeout  time.Duration
-	ScanTimeout    time.Duration
 	QRSessionTTL   time.Duration
 	// KeepaliveInterval controls how often credentials are checked for
 	// renewal; KeepaliveAhead how long before expiry a renewal happens.
 	// Zero values fall back to the defaults in keepalive.go.
 	KeepaliveInterval time.Duration
 	KeepaliveAhead    time.Duration
+	// NotifyChannel (serverchan / pushplus / wecom) with NotifyToken pushes
+	// one message per authorization when an account needs a re-scan. Empty
+	// channel disables notifications.
+	NotifyChannel string
+	NotifyToken   string
+	NotifyTopic   string
 }
 
 type App struct {
@@ -51,6 +56,7 @@ type App struct {
 	pool      *protocol.Pool
 	qr        *qr.Client
 	appIDs    *appIDPolicy
+	notify    *notifier
 
 	mu         sync.Mutex
 	qrSessions map[string]*qr.Session
@@ -136,6 +142,7 @@ func NewApp(cfg Config) (*App, error) {
 		pool:         pool,
 		qr:           qr.NewClient(cfg.RequestTimeout),
 		appIDs:       newAppIDPolicy(),
+		notify:       newNotifier(cfg.NotifyChannel, cfg.NotifyToken, cfg.NotifyTopic),
 		qrSessions:   map[string]*qr.Session{},
 		sessions:     map[string]time.Time{},
 		refreshLocks: map[int64]*sync.Mutex{},
@@ -154,6 +161,7 @@ func (a *App) Close() error {
 		close(a.stopPurge)
 	}
 	<-a.purgeDone
+	a.notify.wait()
 	if a.db != nil {
 		return a.db.Close()
 	}
@@ -904,6 +912,7 @@ func (a *App) refreshLiveness(ctx context.Context, acc *store.WechatAccount) str
 		status := "unknown"
 		if errors.Is(err, protocol.ErrAuthRejected) {
 			status = "expired"
+			a.notify.notifyAccountExpired(acc, err.Error())
 		}
 		_ = a.db.SetAccountStatus(ctx, acc.ID, status)
 		return status

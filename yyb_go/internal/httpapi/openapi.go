@@ -138,9 +138,7 @@ func newOpenAPISpec() map[string]any {
 					"获取小程序code",
 					nil,
 					jsonRequestBody(refSchema("WxappRequest")),
-					defaulted(map[string]any{
-						"200": jsonResponse("getCode 调用结果。", refSchema("WxappResponse")),
-					}),
+					wxappResponses("getCode 调用结果。"),
 				),
 			},
 			"/wxapp/getPhoneNumber": map[string]any{
@@ -149,9 +147,7 @@ func newOpenAPISpec() map[string]any {
 					"获取手机号",
 					nil,
 					jsonRequestBody(refSchema("WxappRequest")),
-					defaulted(map[string]any{
-						"200": jsonResponse("getPhoneNumber 调用结果。", refSchema("WxappResponse")),
-					}),
+					wxappResponses("getPhoneNumber 调用结果。"),
 				),
 			},
 			"/wxapp/operateWxData": map[string]any{
@@ -160,9 +156,7 @@ func newOpenAPISpec() map[string]any {
 					"小程序云函数",
 					nil,
 					jsonRequestBody(refSchema("OperateWXDataRequest")),
-					defaulted(map[string]any{
-						"200": jsonResponse("operateWxData 调用结果。", refSchema("WxappResponse")),
-					}),
+					wxappResponses("operateWxData 调用结果。"),
 				),
 			},
 		},
@@ -270,6 +264,33 @@ func openAPIOperation(tags []string, summary string, parameters []map[string]any
 
 func defaulted(responses map[string]any) map[string]any {
 	responses["default"] = jsonErrorResponse("错误响应。")
+	return responses
+}
+
+// wxappResponses documents the local refusals every wxapp call can produce.
+// They are traffic control, not account failures: the request never reached
+// the upstream and the account state is untouched. Retry-After tells scripts
+// how long to back off.
+func wxappResponses(description string) map[string]any {
+	responses := map[string]any{
+		"200": jsonResponse(description, refSchema("WxappResponse")),
+		"409": jsonErrorResponse("账号授权已失效（login_buffer 刷新被拒），需要重新扫码。"),
+		"429": map[string]any{
+			"description": "本地流量控制拒绝：同账号请求排队过长（限速）或该 AppID 连续取码失败处于冷却（熔断）。请求未发往上游，账号状态未改变。",
+			"headers": map[string]any{
+				"Retry-After": map[string]any{
+					"description": "建议退避的秒数。",
+					"schema":      map[string]any{"type": "integer"},
+				},
+			},
+			"content": map[string]any{
+				"application/json": map[string]any{
+					"schema": refSchema("APIErrorResponse"),
+				},
+			},
+		},
+		"403": jsonErrorResponse("app_id 在服务端黑名单中（网站应用取码会打死授权）。"),
+	}
 	return responses
 }
 
