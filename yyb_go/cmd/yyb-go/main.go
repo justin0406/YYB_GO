@@ -24,10 +24,12 @@ func main() {
 	tcpProxy := flag.String("tcp-proxy", "", "optional TCP proxy: socks5://host:port or http-connect://host:port")
 	authUser := flag.String("auth-user", "", "login username (env: YYB_AUTH_USER, default admin)")
 	authPassword := flag.String("auth-password", "", "login password; when set, /qr /accounts /wxapp require login (env: YYB_AUTH_PASSWORD)")
+	cookieSecure := flag.Bool("cookie-secure", false, "mark the session cookie Secure; set this behind an HTTPS reverse proxy (env: YYB_COOKIE_SECURE)")
 	flag.Parse()
 
 	user := firstNonEmpty(strings.TrimSpace(*authUser), strings.TrimSpace(os.Getenv("YYB_AUTH_USER")), "admin")
 	password := firstNonEmpty(strings.TrimSpace(*authPassword), strings.TrimSpace(os.Getenv("YYB_AUTH_PASSWORD")))
+	secureCookie := *cookieSecure || envIsTruthy(os.Getenv("YYB_COOKIE_SECURE"))
 	if password == "" {
 		log.Printf("WARNING: no login password configured; /qr, /accounts and /wxapp are UNPROTECTED. Set -auth-password or YYB_AUTH_PASSWORD when exposing this service beyond localhost.")
 	}
@@ -48,6 +50,7 @@ func main() {
 		TCPProxy:       *tcpProxy,
 		AuthUser:       user,
 		AuthPassword:   password,
+		CookieSecure:   secureCookie,
 		SessionTTL:     30 * time.Minute,
 		RequestTimeout: 8 * time.Second,
 		AvatarTimeout:  10 * time.Second,
@@ -68,6 +71,12 @@ func main() {
 		Addr:              addr,
 		Handler:           app.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// 批量刷新/重同步接口受 app 层 90s 请求预算约束（超时返回部分结果），
+		// 写超时留出余量；更长的正常路径不会被这里硬切。
+		WriteTimeout:   120 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	go func() {
@@ -93,4 +102,12 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func envIsTruthy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }

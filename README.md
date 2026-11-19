@@ -46,6 +46,7 @@ go run ./cmd/yyb-go -host 127.0.0.1 -port 8000
 | `-tcp-proxy` | — | 空 | 出站 TCP 代理：`socks5://host:port` 或 `http-connect://host:port` |
 | `-auth-user` | `YYB_AUTH_USER` | `admin` | 控制台登录用户名 |
 | `-auth-password` | `YYB_AUTH_PASSWORD` | 空 | 登录密码；为空时**不启用鉴权** |
+| `-cookie-secure` | `YYB_COOKIE_SECURE` | `false` | 会话 Cookie 加 `Secure` 标记；HTTPS 反向代理后部署时开启（直连 HTTPS 自动启用） |
 | — | `YYB_NOTIFY_CHANNEL` | 空 | 掉线通知渠道：`serverchan` / `pushplus` / `wecom` |
 | — | `YYB_NOTIFY_TOKEN` | 空 | 对应渠道的 SendKey / token / webhook key |
 | — | `YYB_NOTIFY_TOPIC` | 空 | 通知分组（渠道支持时使用） |

@@ -8,12 +8,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +49,9 @@ type Config struct {
 	NotifyChannel string
 	NotifyToken   string
 	NotifyTopic   string
+	// CookieSecure marks the session cookie Secure. Direct HTTPS is detected
+	// automatically; set this when serving behind an HTTPS reverse proxy.
+	CookieSecure bool
 }
 
 type App struct {
@@ -79,6 +84,12 @@ type App struct {
 const (
 	sessionCookieName = "yyb_session"
 	sessionLifetime   = 7 * 24 * time.Hour
+	// JSON body 上限：现有接口只传 ref/id 级别的小对象，1MB 远超正常用量；
+	// 恶意/超大 body 在解码前就被拒，不会把内存吃满。
+	maxJSONBodyBytes = 1 << 20
+	// 批量刷新/重同步的整体预算：账号很多时串行扫描可达分钟级；超时后剩余
+	// 账号快速失败并返回部分结果，响应始终能在 WriteTimeout 内完成。
+	bulkRefreshBudget = 90 * time.Second
 )
 
 // protectedPrefixes lists the path prefixes that require authentication when
@@ -181,6 +192,9 @@ func (a *App) startPurger() {
 			log.Printf("purged %d expired session(s)", n)
 		}
 		a.pruneQR()
+		if a.notify != nil {
+			a.notify.pruneSent(sessionLifetime)
+		}
 	}
 	keepaliveOnce := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -208,13 +222,29 @@ func (a *App) startPurger() {
 	}()
 }
 
+// logRefPattern matches the ?ref=<openid> query used by /accounts endpoints.
+var logRefPattern = regexp.MustCompile(`([?&]ref=)[^&]*`)
+
+func redactRefQuery(path string) string {
+	return logRefPattern.ReplaceAllString(path, "${1}***")
+}
+
+// redactingLogFormatter mirrors gin's default log format but masks the ref
+// query value: the access log must not record account identifiers (openid).
+func redactingLogFormatter(params gin.LogFormatterParams) string {
+	return fmt.Sprintf("%s %3d %s| %13v | %15s |%s %-7s %s %s\n%s",
+		params.StatusCodeColor(), params.StatusCode, params.ResetColor(),
+		params.Latency, params.ClientIP, params.MethodColor(), params.Method,
+		params.ResetColor(), redactRefQuery(params.Path), params.ErrorMessage)
+}
+
 func (a *App) Handler() http.Handler {
 	if os.Getenv(gin.EnvGinMode) == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery())
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{Formatter: redactingLogFormatter}), gin.Recovery())
 	if a.cfg.AuthPassword != "" {
 		router.Use(a.requireAuth())
 	}
@@ -412,6 +442,8 @@ func (a *App) doLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(sessionLifetime.Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		// 直接 HTTPS 自动启用；反向代理场景由 CookieSecure 配置显式开启
+		Secure: a.cfg.CookieSecure || r.TLS != nil,
 	})
 	target := next
 	if target == "" {
@@ -433,6 +465,7 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   a.cfg.CookieSecure || r.TLS != nil,
 	})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
@@ -800,7 +833,10 @@ func (a *App) callWXApp(w http.ResponseWriter, r *http.Request, requirePayload b
 	writeJSON(w, http.StatusOK, map[string]any{"openid": acc.OpenID, "result": result})
 }
 
+// decodeOptionalJSON reads an optional JSON body under a hard size cap so an
+// oversized or hostile body is rejected during decode instead of buffered.
 func decodeOptionalJSON(r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxJSONBodyBytes)
 	err := json.NewDecoder(r.Body).Decode(dst)
 	if errors.Is(err, io.EOF) {
 		return nil
@@ -836,27 +872,33 @@ func (a *App) resolveAccountRef(w http.ResponseWriter, r *http.Request, ref stri
 }
 
 func (a *App) refreshAll(w http.ResponseWriter, r *http.Request) {
-	accounts, err := a.db.ListAccounts(r.Context())
+	// 批量接口受整体预算约束：账号多时串行扫描可能超过分钟级，超时后剩余
+	// 账号快速失败并返回部分结果，而不是把响应挂到超过 WriteTimeout。
+	ctx, cancel := context.WithTimeout(r.Context(), bulkRefreshBudget)
+	defer cancel()
+	accounts, err := a.db.ListAccounts(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	out := make([]map[string]any, 0, len(accounts))
 	for _, acc := range accounts {
-		out = append(out, refreshOut(acc, a.refreshLiveness(r.Context(), acc)))
+		out = append(out, refreshOut(acc, a.refreshLiveness(ctx, acc)))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
 func (a *App) resyncAll(w http.ResponseWriter, r *http.Request) {
-	accounts, err := a.db.ListAccounts(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), bulkRefreshBudget)
+	defer cancel()
+	accounts, err := a.db.ListAccounts(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	out := make([]store.AccountPublic, 0, len(accounts))
 	for _, acc := range accounts {
-		updated, err := a.resyncProfile(r.Context(), acc)
+		updated, err := a.resyncProfile(ctx, acc)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

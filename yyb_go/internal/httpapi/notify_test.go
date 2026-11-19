@@ -106,3 +106,18 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+func TestPruneSentDropsAgedKeys(t *testing.T) {
+	n := newNotifier("serverchan", "tok", "")
+	n.sent["1:100"] = time.Now().Add(-2 * sessionLifetime)
+	n.sent["2:200"] = time.Now()
+
+	n.pruneSent(sessionLifetime)
+
+	if _, ok := n.sent["1:100"]; ok {
+		t.Fatal("aged dedupe key must be pruned")
+	}
+	if _, ok := n.sent["2:200"]; !ok {
+		t.Fatal("fresh dedupe key must be kept")
+	}
+}

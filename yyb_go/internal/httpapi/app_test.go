@@ -359,3 +359,50 @@ func TestInvokeWXAppErrorClassification(t *testing.T) {
 		t.Fatalf("transport error must not mark account expired, status = %q", *reloaded.Status)
 	}
 }
+
+func TestJSONBodyOverLimitIsRejected(t *testing.T) {
+	app := newTestApp(t, Config{})
+	handler := app.Handler()
+
+	// 1MB 上限：超出 maxJSONBodyBytes 的 body 在解码阶段被拒，
+	// 不会先被整个读进内存
+	big := strings.Repeat("a", int(maxJSONBodyBytes)+1024)
+	req := httptest.NewRequest(http.MethodPost, "/accounts/resync",
+		strings.NewReader(`{"ref":"`+big+`"}`))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized JSON body status = %d, want 400", rec.Code)
+	}
+}
+
+func TestSessionCookieSecureFollowsConfig(t *testing.T) {
+	login := func(t *testing.T, cfg Config) *http.Cookie {
+		t.Helper()
+		app := newTestApp(t, cfg)
+		handler := app.Handler()
+		form := url.Values{"username": {"admin"}, "password": {"pw"}}
+		req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("POST /login status = %d, want 303", rec.Code)
+		}
+		for _, ck := range rec.Result().Cookies() {
+			if ck.Name == sessionCookieName {
+				return ck
+			}
+		}
+		t.Fatalf("login did not set %s cookie", sessionCookieName)
+		return nil
+	}
+
+	if ck := login(t, Config{AuthUser: "admin", AuthPassword: "pw"}); ck.Secure {
+		t.Fatal("cookie must not be Secure over plain HTTP without config")
+	}
+	if ck := login(t, Config{AuthUser: "admin", AuthPassword: "pw", CookieSecure: true}); !ck.Secure {
+		t.Fatal("cookie must be Secure when CookieSecure is configured")
+	}
+}

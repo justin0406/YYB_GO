@@ -68,6 +68,23 @@ func (n *notifier) claim(accountID int64, authorizationAt int64) bool {
 	return true
 }
 
+// pruneSent drops dedupe keys older than maxAge. A re-scan produces a fresh
+// (account, authorization) key, so aged entries are never consulted again;
+// without pruning the map grows for as long as the process runs.
+func (n *notifier) pruneSent(maxAge time.Duration) {
+	if !n.enabled() {
+		return
+	}
+	cutoff := time.Now().Add(-maxAge)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for key, at := range n.sent {
+		if at.Before(cutoff) {
+			delete(n.sent, key)
+		}
+	}
+}
+
 // notifyAccountExpired pushes one notification about a dead authorization.
 func (n *notifier) notifyAccountExpired(acc *store.WechatAccount, detail string) {
 	if !n.enabled() || acc == nil {
